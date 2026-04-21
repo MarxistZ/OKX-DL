@@ -69,9 +69,7 @@ impl DaySampler {
                     self.lob.apply(&record)?;
                     self.saw_snapshot = self.lob.ready;
                 }
-                "update" if !self.saw_snapshot => {
-                    anyhow::bail!("first valid record must be snapshot")
-                }
+                "update" if !self.saw_snapshot => continue,
                 "update" => self.lob.apply(&record)?,
                 _ => continue,
             }
@@ -581,13 +579,21 @@ mod tests {
     }
 
     #[test]
-    fn process_json_lines_requires_snapshot_before_update() {
-        let input = Cursor::new(
+    fn process_json_lines_ignores_leading_updates_until_snapshot() {
+        let input = Cursor::new(concat!(
             "{\"action\":\"update\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[]}\n",
-        );
+            "{\"action\":\"update\",\"ts\":\"1050\",\"bids\":[[\"100\",\"2\"]],\"asks\":[]}\n",
+            "{\"action\":\"snapshot\",\"ts\":\"1100\",\"bids\":[[\"101\",\"4\"]],\"asks\":[[\"102\",\"5\"]]}\n",
+            "{\"action\":\"update\",\"ts\":\"1200\",\"bids\":[[\"101\",\"6\"]],\"asks\":[]}\n"
+        ));
 
-        let err = process_json_lines(input).unwrap_err();
-        assert!(err.to_string().contains("snapshot"));
+        let snaps = process_json_lines(input).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].ts_ms, 1200);
+        assert_eq!(snaps[0].bid_px[0], 101.0);
+        assert_eq!(snaps[0].bid_sz[0], 6.0);
+        assert_eq!(snaps[0].ask_px[0], 102.0);
+        assert_eq!(snaps[0].ask_sz[0], 5.0);
     }
 
     #[test]
