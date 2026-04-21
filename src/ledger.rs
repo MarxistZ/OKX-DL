@@ -124,7 +124,7 @@ impl DayState {
         parquet_exists && self.process == ProcessState::Success
     }
 
-    fn sync_legacy_flags(&mut self) {
+    pub(crate) fn sync_legacy_flags(&mut self) {
         self.downloaded = self.download == DownloadState::Success;
         self.not_available = self.download == DownloadState::NotAvailable;
         self.processed = self.process == ProcessState::Success;
