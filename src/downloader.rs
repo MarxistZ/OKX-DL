@@ -27,7 +27,7 @@ async fn download_file(
     for attempt in 0..=retries {
         if attempt > 0 {
             let wait = Duration::from_secs(2u64.pow(attempt - 1).min(30));
-            pbar.set_message(format!("等待重试 {}/{retries} ({wait:?})..."));
+            pbar.set_message(format!("等待重试 {attempt}/{retries} ({wait:?})..."));
             sleep(wait).await;
         }
 
