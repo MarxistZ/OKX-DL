@@ -1,5 +1,5 @@
+use crate::ledger::{load_day, save_day, utc_now_rfc3339, DayState, DownloadState};
 use crate::{date_range, file_url, raw_path};
-use crate::ledger::Ledger;
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::NaiveDate;
@@ -9,30 +9,29 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 // ── 下载单文件（含重试 + 指数退避） ──────────────────────────────────────────
 
 /// 返回 Ok(true)=成功，Ok(false)=404，Err=不可恢复错误
 async fn download_file(
-    client:   &Client,
-    url:      &str,
-    out:      &std::path::Path,
-    pbar:     &ProgressBar,
-    retries:  u32,
+    client: &Client,
+    url: &str,
+    out: &std::path::Path,
+    pbar: &ProgressBar,
+    retries: u32,
 ) -> Result<bool> {
     let tmp = out.with_extension("tmp");
 
     for attempt in 0..=retries {
         if attempt > 0 {
             let wait = Duration::from_secs(2u64.pow(attempt - 1).min(30));
-            pbar.set_message(format!("等待重试 {}/{retries} ({wait:?})..."));
+            pbar.set_message(format!("等待重试 {attempt}/{retries} ({wait:?})..."));
             sleep(wait).await;
         }
 
         let resp = match client.get(url).send().await {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!("下载失败 (attempt {attempt}): {e}");
                 continue;
@@ -48,10 +47,12 @@ async fn download_file(
         }
 
         let total = resp.content_length();
-        if let Some(len) = total { pbar.set_length(len); }
+        if let Some(len) = total {
+            pbar.set_length(len);
+        }
 
         // 流式写入 .tmp
-        let mut file   = tokio::fs::File::create(&tmp).await?;
+        let mut file = tokio::fs::File::create(&tmp).await?;
         let mut stream = resp.bytes_stream();
         let mut written = 0u64;
         let mut ok = true;
@@ -111,28 +112,20 @@ async fn download_file(
 // ── 下载单个 (symbol, date) 任务 ─────────────────────────────────────────────
 
 async fn download_one(
-    client:  Arc<Client>,
-    symbol:  String,
-    d:       NaiveDate,
-    sem:     Arc<Semaphore>,
-    total:   ProgressBar,
-    mp:      MultiProgress,
+    client: Arc<Client>,
+    task: DownloadTask,
+    total: ProgressBar,
+    mp: MultiProgress,
     retries: u32,
-) -> (String, NaiveDate, DownloadResult) {
-    let out = raw_path(&symbol, d);
-
-    // 已存在直接跳过
-    if out.exists() {
-        total.inc(1);
-        return (symbol, d, DownloadResult::AlreadyExists);
-    }
+) -> (DownloadTask, DownloadResult) {
+    let out = raw_path(&task.symbol, task.date);
 
     if let Some(parent) = out.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    let url   = file_url(&symbol, d);
-    let label = format!("{symbol} {d}");
+    let url = file_url(&task.symbol, task.date);
+    let label = format!("{} {}", task.symbol, task.date);
 
     let pbar = mp.add(ProgressBar::new(0));
     pbar.set_style(
@@ -142,8 +135,6 @@ async fn download_one(
             .progress_chars("=>-"),
     );
     pbar.set_message(label.clone());
-
-    let _permit = sem.acquire().await.unwrap();
 
     let result = match download_file(&client, &url, &out, &pbar, retries).await {
         Ok(true) => {
@@ -157,35 +148,61 @@ async fn download_one(
         }
         Err(e) => {
             total.println(format!("  ✗ {label}  {e}"));
-            DownloadResult::Failed(e.to_string())
+            DownloadResult::Failed {
+                reason: e.to_string(),
+            }
         }
     };
 
     pbar.finish_and_clear();
     total.inc(1);
-    (symbol, d, result)
+    (task, result)
 }
 
+#[derive(Debug, Clone)]
+pub struct DownloadTask {
+    pub symbol: String,
+    pub date: NaiveDate,
+}
+
+#[derive(Debug, Clone)]
 pub enum DownloadResult {
-    AlreadyExists,
+    Skipped,
     Success,
     NotAvailable,
-    Failed(String),
+    Failed { reason: String },
+}
+
+impl DownloadResult {
+    pub fn is_real_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
+fn should_skip_download(state: &DayState, raw_exists: bool) -> bool {
+    state.can_skip_download(raw_exists)
 }
 
 // ── 批量下载入口 ──────────────────────────────────────────────────────────────
 
 pub async fn download_all(
-    symbols:      &[String],
-    start:        NaiveDate,
-    end:          NaiveDate,
-    mp:           &MultiProgress,
-    concurrency:  usize,
-    retries:      u32,
-) -> Result<()> {
-    let pairs: Vec<(String, NaiveDate)> = symbols
+    symbols: &[String],
+    start: NaiveDate,
+    end: NaiveDate,
+    mp: &MultiProgress,
+    concurrency: usize,
+    retries: u32,
+) -> Result<Vec<(DownloadTask, DownloadResult)>> {
+    let tasks: Vec<DownloadTask> = symbols
         .iter()
-        .flat_map(|s| date_range(start, end).into_iter().map(|d| (s.clone(), d)))
+        .flat_map(|symbol| {
+            date_range(start, end)
+                .into_iter()
+                .map(move |date| DownloadTask {
+                    symbol: symbol.clone(),
+                    date,
+                })
+        })
         .collect();
 
     let client = Arc::new(
@@ -194,9 +211,8 @@ pub async fn download_all(
             .timeout(Duration::from_secs(120))
             .build()?,
     );
-    let sem = Arc::new(Semaphore::new(concurrency));
 
-    let total_bar = mp.add(ProgressBar::new(pairs.len() as u64));
+    let total_bar = mp.add(ProgressBar::new(tasks.len() as u64));
     total_bar.set_style(
         ProgressStyle::default_bar()
             .template("  总进度 [{bar:40}] {pos:>5}/{len} 文件  已用 {elapsed}  ETA {eta}")
@@ -204,58 +220,97 @@ pub async fn download_all(
             .progress_chars("=>-"),
     );
 
-    let mut handles = Vec::with_capacity(pairs.len());
-    for (symbol, d) in pairs {
-        let h = tokio::spawn(download_one(
-            Arc::clone(&client),
-            symbol,
-            d,
-            Arc::clone(&sem),
-            total_bar.clone(),
-            mp.clone(),
-            retries,
-        ));
-        handles.push(h);
-    }
+    let results = futures::stream::iter(tasks.into_iter().map(|task| {
+        let client = Arc::clone(&client);
+        let mp = mp.clone();
+        let total_bar = total_bar.clone();
+        async move {
+            let raw = raw_path(&task.symbol, task.date);
+            let mut state = load_day(&task.symbol, task.date);
+
+            if should_skip_download(&state, raw.exists()) {
+                total_bar.inc(1);
+                return (task, DownloadResult::Skipped);
+            }
+
+            let (task, result) = download_one(client, task, total_bar, mp, retries).await;
+
+            match &result {
+                DownloadResult::Success => {
+                    state.download = DownloadState::Success;
+                    state.download_attempts += 1;
+                    state.raw_present = true;
+                    state.last_error = None;
+                }
+                DownloadResult::NotAvailable => {
+                    state.download = DownloadState::NotAvailable;
+                    state.download_attempts += 1;
+                    state.raw_present = false;
+                    state.last_error = None;
+                }
+                DownloadResult::Failed { reason } => {
+                    state.download = DownloadState::Failed;
+                    state.download_attempts += 1;
+                    state.raw_present = false;
+                    state.last_error = Some(reason.clone());
+                }
+                DownloadResult::Skipped => {}
+            }
+
+            if !matches!(result, DownloadResult::Skipped) {
+                state.sync_legacy_flags();
+                state.updated_at = utc_now_rfc3339();
+                let _ = save_day(&task.symbol, task.date, &state);
+            }
+
+            (task, result)
+        }
+    }))
+    .buffer_unordered(concurrency.max(1))
+    .collect::<Vec<_>>()
+    .await;
 
     let mut ok = 0usize;
     let mut not_avail = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
 
-    for h in handles {
-        if let Ok((symbol, d, result)) = h.await {
-            // 更新 ledger（在同步上下文中需要用 spawn_blocking，
-            // 但 ledger 很轻量，直接在 async 中操作也可接受）
-            match result {
-                DownloadResult::Success => {
-                    ok += 1;
-                    let mut ledger = Ledger::load(&symbol);
-                    ledger.mark_downloaded(d);
-                    ledger.save();
-                }
-                DownloadResult::NotAvailable => {
-                    not_avail += 1;
-                    let mut ledger = Ledger::load(&symbol);
-                    ledger.mark_not_available(d);
-                    ledger.save();
-                }
-                DownloadResult::Failed(_) => {
-                    failed += 1;
-                    let mut ledger = Ledger::load(&symbol);
-                    ledger.inc_attempt(d);
-                    ledger.save();
-                }
-                DownloadResult::AlreadyExists => {
-                    skipped += 1;
-                }
-            }
+    for (_, result) in &results {
+        match result {
+            DownloadResult::Success => ok += 1,
+            DownloadResult::NotAvailable => not_avail += 1,
+            DownloadResult::Failed { .. } => failed += 1,
+            DownloadResult::Skipped => skipped += 1,
         }
     }
 
     total_bar.finish_with_message("下载完成");
-    tracing::info!(
-        "下载结果：成功 {ok}，不存在 {not_avail}，跳过 {skipped}，失败 {failed}"
-    );
-    Ok(())
+    tracing::info!("下载结果：成功 {ok}，不存在 {not_avail}，跳过 {skipped}，失败 {failed}");
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::{DayState, DownloadState};
+
+    #[test]
+    fn should_skip_download_only_for_existing_successful_raw() {
+        let state = DayState {
+            download: DownloadState::Success,
+            ..Default::default()
+        };
+
+        assert!(should_skip_download(&state, true));
+        assert!(!should_skip_download(&state, false));
+    }
+
+    #[test]
+    fn failed_downloads_are_real_failures_but_404_is_not() {
+        assert!(DownloadResult::Failed {
+            reason: "network".to_string()
+        }
+        .is_real_failure());
+        assert!(!DownloadResult::NotAvailable.is_real_failure());
+    }
 }
