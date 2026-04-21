@@ -1,8 +1,6 @@
 use crate::DEPTH;
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 // ── 价格编码 ─────────────────────────────────────────────────────────────────
 // 价格 × 1_000_000 取整为 i64，避免浮点排序不确定性。
@@ -182,42 +180,6 @@ impl Lob {
         }
         s
     }
-
-    // ── Checkpoint ───────────────────────────────────────────────────────────
-
-    pub fn save_checkpoint(&self, path: &Path) -> Result<()> {
-        let ckpt = LobCheckpoint {
-            bids: self.bids.iter().map(|(&k, &v)| (k, v)).collect(),
-            asks: self.asks.iter().map(|(&k, &v)| (k, v)).collect(),
-            ts_ms: self.ts_ms,
-        };
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string(&ckpt)?)?;
-        std::fs::rename(&tmp, path)?; // 原子写入
-        Ok(())
-    }
-
-    pub fn load_checkpoint(path: &Path) -> Result<Self> {
-        let data = std::fs::read_to_string(path)?;
-        let ckpt: LobCheckpoint = serde_json::from_str(&data)?;
-        let mut lob = Lob::new();
-        for (k, v) in ckpt.bids {
-            lob.bids.insert(k, v);
-        }
-        for (k, v) in ckpt.asks {
-            lob.asks.insert(k, v);
-        }
-        lob.ts_ms = ckpt.ts_ms;
-        lob.ready = !lob.bids.is_empty() || !lob.asks.is_empty();
-        Ok(lob)
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct LobCheckpoint {
-    bids: Vec<(i64, f32)>,
-    asks: Vec<(i64, f32)>,
-    ts_ms: i64,
 }
 
 #[cfg(test)]

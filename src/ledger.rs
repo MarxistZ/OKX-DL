@@ -4,7 +4,6 @@
 use crate::{ledger_dir, ledger_path};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -150,12 +149,6 @@ impl DayState {
     }
 }
 
-pub struct Ledger {
-    symbol: String,
-    map: HashMap<String, DayState>,
-    dirty: bool,
-}
-
 fn legacy_ledger_path(symbol: &str) -> PathBuf {
     ledger_dir().join(format!("{symbol}.json"))
 }
@@ -207,96 +200,6 @@ pub fn save_day(symbol: &str, d: NaiveDate, state: &DayState) -> anyhow::Result<
     std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
-}
-
-impl Ledger {
-    pub fn load(symbol: &str) -> Self {
-        let path = legacy_ledger_path(symbol);
-        let map = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-        Self {
-            symbol: symbol.to_string(),
-            map,
-            dirty: false,
-        }
-    }
-
-    fn key(d: NaiveDate) -> String {
-        d.format("%Y-%m-%d").to_string()
-    }
-
-    pub fn get(&self, d: NaiveDate) -> DayState {
-        self.map.get(&Self::key(d)).cloned().unwrap_or_default()
-    }
-
-    fn get_mut(&mut self, d: NaiveDate) -> &mut DayState {
-        self.dirty = true;
-        self.map.entry(Self::key(d)).or_default()
-    }
-
-    pub fn mark_downloaded(&mut self, d: NaiveDate) {
-        let s = self.get_mut(d);
-        s.download = DownloadState::Success;
-        s.download_attempts += 1;
-        s.last_error = None;
-        s.sync_legacy_flags();
-    }
-
-    pub fn mark_not_available(&mut self, d: NaiveDate) {
-        let s = self.get_mut(d);
-        s.download = DownloadState::NotAvailable;
-        s.download_attempts += 1;
-        s.last_error = None;
-        s.sync_legacy_flags();
-    }
-
-    pub fn inc_attempt(&mut self, d: NaiveDate) {
-        let s = self.get_mut(d);
-        s.download_attempts += 1;
-        s.download = DownloadState::Failed;
-        s.sync_legacy_flags();
-    }
-
-    pub fn mark_validated(&mut self, d: NaiveDate, rows: usize) {
-        let s = self.get_mut(d);
-        s.process = ProcessState::Success;
-        s.rows = Some(rows);
-        s.parquet_present = true;
-        s.last_error = None;
-        s.sync_legacy_flags();
-    }
-
-    pub fn mark_raw_deleted(&mut self, d: NaiveDate) {
-        let s = self.get_mut(d);
-        s.raw_deleted = true;
-        s.sync_legacy_flags();
-    }
-
-    pub fn save(&mut self) {
-        if !self.dirty {
-            return;
-        }
-        let path = legacy_ledger_path(&self.symbol);
-        let tmp = path.with_extension("tmp");
-        if let Ok(json) = serde_json::to_string_pretty(&self.map) {
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-                self.dirty = false;
-            }
-        }
-    }
-}
-
-impl Drop for Ledger {
-    fn drop(&mut self) {
-        self.save();
-    }
 }
 
 #[cfg(test)]

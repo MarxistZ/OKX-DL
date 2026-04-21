@@ -214,24 +214,23 @@ fn main() -> Result<()> {
         ))?;
 
         for (task, result) in download_results {
-            match result {
-                downloader::DownloadResult::NotAvailable => {
-                    summary.not_available.push(FailureRecord {
-                        symbol: task.symbol,
-                        date: task.date,
-                        stage: "download",
-                        reason: "404".to_string(),
-                    });
-                }
-                downloader::DownloadResult::Failed { reason } => {
-                    summary.failures.push(FailureRecord {
-                        symbol: task.symbol,
-                        date: task.date,
-                        stage: "download",
-                        reason,
-                    });
-                }
-                downloader::DownloadResult::Skipped | downloader::DownloadResult::Success => {}
+            if matches!(result, downloader::DownloadResult::NotAvailable) {
+                summary.not_available.push(FailureRecord {
+                    symbol: task.symbol,
+                    date: task.date,
+                    stage: "download",
+                    reason: "404".to_string(),
+                });
+            } else if result.is_real_failure() {
+                let downloader::DownloadResult::Failed { reason } = result else {
+                    unreachable!("real failures are always DownloadResult::Failed")
+                };
+                summary.failures.push(FailureRecord {
+                    symbol: task.symbol,
+                    date: task.date,
+                    stage: "download",
+                    reason,
+                });
             }
         }
     }

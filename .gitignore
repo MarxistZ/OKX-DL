@@ -1,5 +1,6 @@
 .worktrees/
 target/
 data/
+logs/
 .codex
 .DS_Store

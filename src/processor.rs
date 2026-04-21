@@ -204,7 +204,7 @@ pub struct ProcessTask {
 #[derive(Debug, Clone)]
 pub enum ProcessResult {
     Skipped,
-    Success { rows: usize, raw_deleted: bool },
+    Success,
     Failed { reason: String },
 }
 
@@ -314,10 +314,7 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
     state.sync_legacy_flags();
     let _ = save_day(&task.symbol, task.date, &state);
 
-    ProcessResult::Success {
-        rows: snaps.len(),
-        raw_deleted,
-    }
+    ProcessResult::Success
 }
 
 #[cfg(test)]
