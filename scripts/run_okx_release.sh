@@ -59,6 +59,10 @@ if [[ -n "${DL_RETRIES:-}" ]]; then
   cmd+=("--dl-retries" "$DL_RETRIES")
 fi
 
+if [[ -n "${RAW_RETENTION:-}" ]]; then
+  cmd+=("--raw-retention" "$RAW_RETENTION")
+fi
+
 echo "log file: $log_file"
 printf 'command:'
 for arg in "${cmd[@]}"; do

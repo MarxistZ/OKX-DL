@@ -1,17 +1,46 @@
-use crate::ledger::{load_day, save_day, utc_now_rfc3339, DayState, DownloadState};
+use crate::ledger::{load_day, mutate_day, DayState, DownloadState};
 use crate::{date_range, file_url, raw_path};
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::NaiveDate;
+use flate2::read::GzDecoder;
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
 // ── 下载单文件（含重试 + 指数退避） ──────────────────────────────────────────
+
+fn validate_archive_file(path: &Path) -> Result<()> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        anyhow::bail!("empty archive");
+    }
+
+    let mut gz = GzDecoder::new(file);
+    let mut saw_entry = false;
+
+    {
+        let mut archive = tar::Archive::new(&mut gz);
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            saw_entry = true;
+            std::io::copy(&mut entry, &mut std::io::sink())?;
+        }
+    }
+
+    if !saw_entry {
+        anyhow::bail!("archive contains no entries");
+    }
+
+    std::io::copy(&mut gz, &mut std::io::sink())?;
+
+    Ok(())
+}
 
 /// 返回 Ok(true)=成功，Ok(false)=404，Err=不可恢复错误
 async fn download_file(
@@ -95,6 +124,21 @@ async fn download_file(
             if written != expected {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 tracing::warn!("大小不匹配：期望 {expected}，实际 {written} (attempt {attempt})");
+                continue;
+            }
+        }
+
+        let validate_path = tmp.clone();
+        match tokio::task::spawn_blocking(move || validate_archive_file(&validate_path)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                tracing::warn!("归档校验失败 (attempt {attempt}): {err}");
+                continue;
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                tracing::warn!("归档校验任务失败 (attempt {attempt}): {err}");
                 continue;
             }
         }
@@ -183,6 +227,41 @@ fn should_skip_download(state: &DayState, raw_exists: bool) -> bool {
     state.can_skip_download(raw_exists)
 }
 
+fn persist_download_result(task: &DownloadTask, result: &DownloadResult) {
+    let persisted = mutate_day(&task.symbol, task.date, |state| {
+        match result {
+            DownloadResult::Success => {
+                state.download = DownloadState::Success;
+                state.download_attempts += 1;
+                state.raw_deleted = false;
+                state.last_error = None;
+            }
+            DownloadResult::NotAvailable => {
+                state.download = DownloadState::NotAvailable;
+                state.download_attempts += 1;
+                state.raw_deleted = false;
+                state.last_error = None;
+            }
+            DownloadResult::Failed { reason } => {
+                state.download = DownloadState::Failed;
+                state.download_attempts += 1;
+                state.raw_deleted = false;
+                state.last_error = Some(reason.clone());
+            }
+            DownloadResult::Skipped => {}
+        }
+        Ok(())
+    });
+
+    if let Err(err) = persisted {
+        tracing::warn!(
+            "写入下载 ledger 失败 {} {}: {err}",
+            task.symbol,
+            task.date
+        );
+    }
+}
+
 // ── 批量下载入口 ──────────────────────────────────────────────────────────────
 
 pub async fn download_all(
@@ -226,7 +305,7 @@ pub async fn download_all(
         let total_bar = total_bar.clone();
         async move {
             let raw = raw_path(&task.symbol, task.date);
-            let mut state = load_day(&task.symbol, task.date);
+            let state = load_day(&task.symbol, task.date);
 
             if should_skip_download(&state, raw.exists()) {
                 total_bar.inc(1);
@@ -235,32 +314,8 @@ pub async fn download_all(
 
             let (task, result) = download_one(client, task, total_bar, mp, retries).await;
 
-            match &result {
-                DownloadResult::Success => {
-                    state.download = DownloadState::Success;
-                    state.download_attempts += 1;
-                    state.raw_present = true;
-                    state.last_error = None;
-                }
-                DownloadResult::NotAvailable => {
-                    state.download = DownloadState::NotAvailable;
-                    state.download_attempts += 1;
-                    state.raw_present = false;
-                    state.last_error = None;
-                }
-                DownloadResult::Failed { reason } => {
-                    state.download = DownloadState::Failed;
-                    state.download_attempts += 1;
-                    state.raw_present = false;
-                    state.last_error = Some(reason.clone());
-                }
-                DownloadResult::Skipped => {}
-            }
-
             if !matches!(result, DownloadResult::Skipped) {
-                state.sync_legacy_flags();
-                state.updated_at = utc_now_rfc3339();
-                let _ = save_day(&task.symbol, task.date, &state);
+                persist_download_result(&task, &result);
             }
 
             (task, result)
@@ -293,6 +348,33 @@ pub async fn download_all(
 mod tests {
     use super::*;
     use crate::ledger::{DayState, DownloadState};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::Builder;
+
+    fn unique_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("okx-lob-{name}-{nanos}.tar.gz"))
+    }
+
+    fn write_valid_archive(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = Builder::new(encoder);
+        let body = b"{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "day.json", &body[..]).unwrap();
+        tar.finish().unwrap();
+    }
 
     #[test]
     fn should_skip_download_only_for_existing_successful_raw() {
@@ -312,5 +394,40 @@ mod tests {
         }
         .is_real_failure());
         assert!(!DownloadResult::NotAvailable.is_real_failure());
+    }
+
+    #[test]
+    fn download_validation_rejects_empty_file() {
+        let path = unique_path("empty");
+        std::fs::write(&path, []).unwrap();
+
+        let err = validate_archive_file(&path).unwrap_err();
+
+        assert!(err.to_string().contains("empty"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn download_validation_rejects_truncated_gzip() {
+        let path = unique_path("truncated");
+        write_valid_archive(&path);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len().saturating_sub(8));
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(validate_archive_file(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn download_validation_rejects_invalid_tar_payload() {
+        let path = unique_path("invalid-tar");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(b"not a tar archive").unwrap();
+        encoder.finish().unwrap();
+
+        assert!(validate_archive_file(&path).is_err());
+        let _ = std::fs::remove_file(path);
     }
 }

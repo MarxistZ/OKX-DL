@@ -55,8 +55,9 @@ printf '%s\n' "$@" > "$ARGS_FILE"
 exit 0
 EOF
   chmod +x "$stub_path"
+  mkdir -p "$TMP_DIR/logs"
 
-  before_count="$(find "$ROOT_DIR/logs" -maxdepth 1 -type f -name 'run_*_process.log' 2>/dev/null | wc -l | tr -d ' ')"
+  before_count="$(find "$TMP_DIR/logs" -maxdepth 1 -type f -name 'run_*_process.log' 2>/dev/null | wc -l | tr -d ' ')"
 
   START=2024-07-01 \
   END=2024-07-02 \
@@ -66,10 +67,11 @@ EOF
   DL_CONCURRENCY=3 \
   DL_RETRIES=4 \
   BIN="$stub_path" \
+  LOG_DIR="$TMP_DIR/logs" \
   ARGS_FILE="$args_file" \
   bash "$SCRIPT_PATH" >/dev/null
 
-  after_count="$(find "$ROOT_DIR/logs" -maxdepth 1 -type f -name 'run_*_process.log' 2>/dev/null | wc -l | tr -d ' ')"
+  after_count="$(find "$TMP_DIR/logs" -maxdepth 1 -type f -name 'run_*_process.log' 2>/dev/null | wc -l | tr -d ' ')"
 
   assert_eq "$after_count" "$((before_count + 1))" "expected one new process log file"
   assert_eq "$(cat "$args_file")" $'--process-only\n--symbol\nBTC-USDT\n--start\n2024-07-01\n--end\n2024-07-02\n--workers\n2\n--dl-concurrency\n3\n--dl-retries\n4' "unexpected CLI argument wiring"
@@ -86,7 +88,7 @@ EOF
   chmod +x "$stub_path"
 
   set +e
-  START=2024-07-01 END=2024-07-02 BIN="$stub_path" bash "$SCRIPT_PATH" >/dev/null 2>&1
+  START=2024-07-01 END=2024-07-02 BIN="$stub_path" LOG_DIR="$TMP_DIR/logs" bash "$SCRIPT_PATH" >/dev/null 2>&1
   status=$?
   set -e
 

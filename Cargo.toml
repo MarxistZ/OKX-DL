@@ -25,6 +25,8 @@ anyhow = "1"
 indicatif = "0.17"
 # 并行
 rayon = "1"
+# 文件锁
+fs2 = "0.4"
 # 解压
 tar    = "0.4"
 flate2 = "1"
