@@ -11,8 +11,21 @@ use std::path::Path;
 const SCALE: f64 = 1_000_000.0;
 
 #[inline]
-fn encode(s: &str) -> i64 {
-    (s.parse::<f64>().unwrap_or(0.0) * SCALE).round() as i64
+fn encode(s: &str) -> Option<i64> {
+    let px = s.parse::<f64>().ok()?;
+    if !px.is_finite() || px <= 0.0 {
+        return None;
+    }
+    Some((px * SCALE).round() as i64)
+}
+
+#[inline]
+fn parse_qty(s: &str) -> Option<f32> {
+    let qty = s.parse::<f32>().ok()?;
+    if !qty.is_finite() || qty < 0.0 {
+        return None;
+    }
+    Some(qty)
 }
 #[inline]
 pub fn decode(n: i64) -> f32 {
@@ -88,31 +101,68 @@ impl Lob {
                 self.bids.clear();
                 self.asks.clear();
                 for level in &record.bids {
-                    if level.len() < 2 { continue; }
-                    let q = level[1].parse::<f32>().unwrap_or(0.0);
-                    if q > 0.0 { self.bids.insert(-encode(&level[0]), q); }
+                    if level.len() < 2 {
+                        continue;
+                    }
+                    let Some(px) = encode(&level[0]) else {
+                        continue;
+                    };
+                    let Some(q) = parse_qty(&level[1]) else {
+                        continue;
+                    };
+                    if q > 0.0 {
+                        self.bids.insert(-px, q);
+                    }
                 }
                 for level in &record.asks {
-                    if level.len() < 2 { continue; }
-                    let q = level[1].parse::<f32>().unwrap_or(0.0);
-                    if q > 0.0 { self.asks.insert(encode(&level[0]), q); }
+                    if level.len() < 2 {
+                        continue;
+                    }
+                    let Some(px) = encode(&level[0]) else {
+                        continue;
+                    };
+                    let Some(q) = parse_qty(&level[1]) else {
+                        continue;
+                    };
+                    if q > 0.0 {
+                        self.asks.insert(px, q);
+                    }
                 }
                 self.ready = true;
             }
             "update" => {
                 for level in &record.bids {
-                    if level.len() < 2 { continue; }
-                    let key = -encode(&level[0]);
-                    let q   = level[1].parse::<f32>().unwrap_or(0.0);
-                    if q == 0.0 { self.bids.remove(&key); }
-                    else        { self.bids.insert(key, q); }
+                    if level.len() < 2 {
+                        continue;
+                    }
+                    let Some(px) = encode(&level[0]) else {
+                        continue;
+                    };
+                    let Some(q) = parse_qty(&level[1]) else {
+                        continue;
+                    };
+                    let key = -px;
+                    if q == 0.0 {
+                        self.bids.remove(&key);
+                    } else {
+                        self.bids.insert(key, q);
+                    }
                 }
                 for level in &record.asks {
-                    if level.len() < 2 { continue; }
-                    let key = encode(&level[0]);
-                    let q   = level[1].parse::<f32>().unwrap_or(0.0);
-                    if q == 0.0 { self.asks.remove(&key); }
-                    else        { self.asks.insert(key, q); }
+                    if level.len() < 2 {
+                        continue;
+                    }
+                    let Some(key) = encode(&level[0]) else {
+                        continue;
+                    };
+                    let Some(q) = parse_qty(&level[1]) else {
+                        continue;
+                    };
+                    if q == 0.0 {
+                        self.asks.remove(&key);
+                    } else {
+                        self.asks.insert(key, q);
+                    }
                 }
             }
             _ => {}
@@ -164,4 +214,59 @@ struct LobCheckpoint {
     bids:  Vec<(i64, f32)>,
     asks:  Vec<(i64, f32)>,
     ts_ms: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
+        OkxRecord {
+            action: "snapshot".to_string(),
+            ts: "1000".to_string(),
+            bids: bids
+                .iter()
+                .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
+                .collect(),
+            asks: asks
+                .iter()
+                .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
+                .collect(),
+        }
+    }
+
+    fn update(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
+        OkxRecord {
+            action: "update".to_string(),
+            ts: "1100".to_string(),
+            bids: bids
+                .iter()
+                .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
+                .collect(),
+            asks: asks
+                .iter()
+                .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn snapshot_ignores_invalid_price_levels() {
+        let mut lob = Lob::new();
+        lob.apply(&snapshot(&[("bad", "1"), ("100.5", "2")], &[("101.0", "3")]));
+
+        let snap = lob.snapshot(1000);
+        assert_eq!(snap.bid_px[0], 100.5);
+        assert!(snap.bid_px[1].is_nan());
+    }
+
+    #[test]
+    fn update_zero_quantity_removes_existing_level() {
+        let mut lob = Lob::new();
+        lob.apply(&snapshot(&[("100.5", "2")], &[("101.0", "3")]));
+        lob.apply(&update(&[("100.5", "0")], &[]));
+
+        let snap = lob.snapshot(1100);
+        assert!(snap.bid_px[0].is_nan());
+    }
 }
