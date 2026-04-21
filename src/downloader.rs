@@ -12,12 +12,6 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
-#[cfg(test)]
-use crate::ledger::{load_day, mutate_day, DayState, DownloadState};
-#[cfg(test)]
-use crate::{date_range, raw_path};
-#[cfg(test)]
-use chrono::NaiveDate;
 
 // ── 下载单文件（含重试 + 指数退避） ──────────────────────────────────────────
 
@@ -156,59 +150,7 @@ async fn download_file(
 
     // 所有重试耗尽
     let _ = tokio::fs::remove_file(&tmp).await;
-    Err(anyhow::anyhow!("下载失败，已重试 {retries} 次"))
-}
-
-// ── 下载单个 (symbol, date) 任务 ─────────────────────────────────────────────
-
-#[cfg(test)]
-#[allow(dead_code)]
-async fn download_one(
-    client: Arc<Client>,
-    task: DownloadTask,
-    total: ProgressBar,
-    mp: MultiProgress,
-    retries: u32,
-) -> (DownloadTask, DownloadResult) {
-    let out = raw_path(&task.symbol, task.date);
-
-    if let Some(parent) = out.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-
-    let url = file_url(&task.symbol, task.date);
-    let label = format!("{} {}", task.symbol, task.date);
-
-    let pbar = mp.add(ProgressBar::new(0));
-    pbar.set_style(
-        ProgressStyle::default_bar()
-            .template("  {msg:25} [{bar:25}] {bytes:>9}/{total_bytes:>9} {bytes_per_sec:>10}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pbar.set_message(label.clone());
-
-    let result = match download_file(&client, &url, &out, &pbar, retries).await {
-        Ok(true) => {
-            let mb = out.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
-            total.println(format!("  ✓ {label}  {mb:.1} MB"));
-            DownloadResult::Success
-        }
-        Ok(false) => {
-            total.println(format!("  - {label}  (404)"));
-            DownloadResult::NotAvailable
-        }
-        Err(e) => {
-            total.println(format!("  ✗ {label}  {e}"));
-            DownloadResult::Failed {
-                reason: e.to_string(),
-            }
-        }
-    };
-
-    pbar.finish_and_clear();
-    total.inc(1);
-    (task, result)
+    Err(anyhow::anyhow!("下载失败，已重试 {retries} 次（共 {} 次尝试）", retries + 1))
 }
 
 #[derive(Debug, Clone)]
@@ -255,162 +197,8 @@ pub async fn download_stage(
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct DownloadTask {
-    pub symbol: String,
-    pub date: NaiveDate,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum DownloadResult {
-    Skipped,
-    Success,
-    NotAvailable,
-    Failed { reason: String },
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-impl DownloadResult {
-    pub fn is_real_failure(&self) -> bool {
-        matches!(self, Self::Failed { .. })
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn should_skip_download(state: &DayState, raw_exists: bool) -> bool {
-    state.can_skip_download(raw_exists)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn persist_download_result(task: &DownloadTask, result: &DownloadResult) {
-    let persisted = mutate_day(&task.symbol, task.date, |state| {
-        match result {
-            DownloadResult::Success => {
-                state.download = DownloadState::Success;
-                state.download_attempts += 1;
-                state.raw_deleted = false;
-                state.last_error = None;
-            }
-            DownloadResult::NotAvailable => {
-                state.download = DownloadState::NotAvailable;
-                state.download_attempts += 1;
-                state.raw_deleted = false;
-                state.last_error = None;
-            }
-            DownloadResult::Failed { reason } => {
-                state.download = DownloadState::Failed;
-                state.download_attempts += 1;
-                state.raw_deleted = false;
-                state.last_error = Some(reason.clone());
-            }
-            DownloadResult::Skipped => {}
-        }
-        Ok(())
-    });
-
-    if let Err(err) = persisted {
-        tracing::warn!(
-            "写入下载 ledger 失败 {} {}: {err}",
-            task.symbol,
-            task.date
-        );
-    }
-}
-
-// ── 批量下载入口 ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub async fn download_all(
-    symbols: &[String],
-    start: NaiveDate,
-    end: NaiveDate,
-    mp: &MultiProgress,
-    concurrency: usize,
-    retries: u32,
-) -> Result<Vec<(DownloadTask, DownloadResult)>> {
-    let tasks: Vec<DownloadTask> = symbols
-        .iter()
-        .flat_map(|symbol| {
-            date_range(start, end)
-                .into_iter()
-                .map(move |date| DownloadTask {
-                    symbol: symbol.clone(),
-                    date,
-                })
-        })
-        .collect();
-
-    let client = Arc::new(
-        Client::builder()
-            .user_agent("Mozilla/5.0")
-            .timeout(Duration::from_secs(120))
-            .build()?,
-    );
-
-    let total_bar = mp.add(ProgressBar::new(tasks.len() as u64));
-    total_bar.set_style(
-        ProgressStyle::default_bar()
-            .template("  总进度 [{bar:40}] {pos:>5}/{len} 文件  已用 {elapsed}  ETA {eta}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-
-    let results = futures::stream::iter(tasks.into_iter().map(|task| {
-        let client = Arc::clone(&client);
-        let mp = mp.clone();
-        let total_bar = total_bar.clone();
-        async move {
-            let raw = raw_path(&task.symbol, task.date);
-            let state = load_day(&task.symbol, task.date);
-
-            if should_skip_download(&state, raw.exists()) {
-                total_bar.inc(1);
-                return (task, DownloadResult::Skipped);
-            }
-
-            let (task, result) = download_one(client, task, total_bar, mp, retries).await;
-
-            if !matches!(result, DownloadResult::Skipped) {
-                persist_download_result(&task, &result);
-            }
-
-            (task, result)
-        }
-    }))
-    .buffer_unordered(concurrency.max(1))
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut ok = 0usize;
-    let mut not_avail = 0usize;
-    let mut failed = 0usize;
-    let mut skipped = 0usize;
-
-    for (_, result) in &results {
-        match result {
-            DownloadResult::Success => ok += 1,
-            DownloadResult::NotAvailable => not_avail += 1,
-            DownloadResult::Failed { .. } => failed += 1,
-            DownloadResult::Skipped => skipped += 1,
-        }
-    }
-
-    total_bar.finish_with_message("下载完成");
-    tracing::info!("下载结果：成功 {ok}，不存在 {not_avail}，跳过 {skipped}，失败 {failed}");
-    Ok(results)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{DayState, DownloadState};
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -437,26 +225,6 @@ mod tests {
         header.set_cksum();
         tar.append_data(&mut header, "day.json", &body[..]).unwrap();
         tar.finish().unwrap();
-    }
-
-    #[test]
-    fn should_skip_download_only_for_existing_successful_raw() {
-        let state = DayState {
-            download: DownloadState::Success,
-            ..Default::default()
-        };
-
-        assert!(should_skip_download(&state, true));
-        assert!(!should_skip_download(&state, false));
-    }
-
-    #[test]
-    fn failed_downloads_are_real_failures_but_404_is_not() {
-        assert!(DownloadResult::Failed {
-            reason: "network".to_string()
-        }
-        .is_real_failure());
-        assert!(!DownloadResult::NotAvailable.is_real_failure());
     }
 
     #[test]

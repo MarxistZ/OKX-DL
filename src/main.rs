@@ -16,23 +16,6 @@ pub const DEPTH: usize = 20;
 pub const SAMPLE_MS: i64 = 100;
 pub const BASE_URL: &str = "https://static.okx.com/cdn/okx/match/orderbook/L2/400lv/daily";
 
-pub const SPOTS: &[&str] = &[
-    "BTC-USDT",
-    "ETH-USDT",
-    "SOL-USDT",
-    "BNB-USDT",
-    "XRP-USDT",
-    "DOGE-USDT",
-    "LINK-USDT",
-    "AVAX-USDT",
-];
-
-pub fn all_symbols() -> Vec<String> {
-    let mut v: Vec<String> = SPOTS.iter().map(|s| s.to_string()).collect();
-    v.extend(SPOTS.iter().map(|s| format!("{s}-SWAP")));
-    v
-}
-
 // ── 路径工具 ─────────────────────────────────────────────────────────────────
 
 pub fn raw_dir() -> PathBuf {
@@ -89,9 +72,9 @@ fn validate_date_bounds(start: NaiveDate, end: NaiveDate) -> Result<()> {
 #[derive(Parser)]
 #[command(name = "okx-lob", about = "OKX L2 Orderbook 历史数据流水线（鲁棒版）")]
 struct Cli {
-    /// 单个币种，如 BTC-USDT
-    #[arg(long)]
-    symbol: Option<String>,
+    /// 币种列表，如 --symbol BTC-USDT ETH-USDT BTC-USDT-SWAP
+    #[arg(long = "symbol", num_args = 1.., required = true)]
+    symbols: Vec<String>,
 
     /// 起始日期 YYYY-MM-DD
     #[arg(long, default_value = "2024-01-01")]
@@ -153,10 +136,7 @@ fn main() -> Result<()> {
         None => chrono::Local::now().date_naive(),
     };
     validate_date_bounds(start, end)?;
-    let symbols: Vec<String> = match &cli.symbol {
-        Some(s) => vec![s.clone()],
-        None => all_symbols(),
-    };
+    let symbols = cli.symbols.clone();
     let workers = cli.workers.unwrap_or_else(|| {
         thread::available_parallelism()
             .map(|n| n.get())
@@ -180,6 +160,7 @@ fn main() -> Result<()> {
         raw_check_interval: Duration::from_secs(cli.raw_check_interval_secs.max(1)),
         retry_delay: Duration::from_secs(cli.retry_delay_secs),
         dl_retries: cli.dl_retries,
+        max_retries: 3,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -189,9 +170,10 @@ fn main() -> Result<()> {
 
     let report = rt.block_on(pipeline::run(&symbols, start, end, config))?;
     tracing::info!(
-        "完成：success {}  not_available {}",
+        "完成：success {}  not_available {}  failed {}",
         report.success_count,
-        report.not_available_count
+        report.not_available_count,
+        report.failed_count
     );
 
     tracing::info!("=== 完成 ===");
@@ -201,6 +183,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use chrono::NaiveDate;
 
     #[test]
@@ -218,5 +201,42 @@ mod tests {
     fn validate_date_bounds_accepts_equal_dates() {
         let day = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
         validate_date_bounds(day, day).unwrap();
+    }
+
+    #[test]
+    fn cli_accepts_multiple_symbols_when_symbol_is_last() {
+        let cli = Cli::try_parse_from([
+            "okx-lob",
+            "--start",
+            "2024-07-01",
+            "--end",
+            "2024-07-02",
+            "--symbol",
+            "BTC-USDT",
+            "ETH-USDT",
+            "BTC-USDT-SWAP",
+            "ETH-USDT-SWAP",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.symbols,
+            vec![
+                "BTC-USDT".to_string(),
+                "ETH-USDT".to_string(),
+                "BTC-USDT-SWAP".to_string(),
+                "ETH-USDT-SWAP".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_requires_symbol_argument() {
+        let err = Cli::try_parse_from(["okx-lob", "--start", "2024-07-01"])
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+
+        assert!(msg.contains("--symbol"));
     }
 }

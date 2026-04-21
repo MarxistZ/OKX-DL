@@ -74,12 +74,14 @@ pub struct PipelineConfig {
     pub raw_check_interval: Duration,
     pub retry_delay: Duration,
     pub dl_retries: u32,
+    pub max_retries: u32,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PipelineReport {
     pub success_count: usize,
     pub not_available_count: usize,
+    pub failed_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,13 +97,15 @@ pub struct StartupPlan {
 struct ScheduledTask {
     ready_at: Instant,
     task: Task,
+    retries: u32,
 }
 
 impl ScheduledTask {
-    fn new(task: Task, delay: Duration) -> Self {
+    fn new(task: Task, delay: Duration, retries: u32) -> Self {
         Self {
             ready_at: Instant::now() + delay,
             task,
+            retries,
         }
     }
 }
@@ -213,6 +217,7 @@ pub async fn run_with_stages(
     let mut report = PipelineReport {
         success_count: startup.success_count,
         not_available_count: startup.not_available_count,
+        failed_count: 0,
     };
     let mut delayed = Vec::<ScheduledTask>::new();
     let mut downloads = JoinSet::new();
@@ -270,7 +275,29 @@ pub async fn run_with_stages(
                         cleanup_parquet_artifacts(&config.paths, &task)?;
                         cleanup_raw_artifacts(&config.paths, &task)?;
                         persist_process_failure(&task, &reason)?;
-                        delayed.push(ScheduledTask::new(task, config.retry_delay));
+                        if delayed.iter().any(|s| s.task == task) {
+                            let next_retries = delayed
+                                .iter()
+                                .find(|s| s.task == task)
+                                .map(|s| s.retries)
+                                .unwrap_or(0);
+                            if next_retries < config.max_retries {
+                                delayed.retain(|s| s.task != task);
+                                delayed
+                                    .push(ScheduledTask::new(task, config.retry_delay, next_retries + 1));
+                            } else {
+                                delayed.retain(|s| s.task != task);
+                                startup.remaining = startup.remaining.saturating_sub(1);
+                                report.failed_count += 1;
+                                tracing::error!(
+                                    "任务重试耗尽 {} {}: {reason}",
+                                    task.symbol,
+                                    task.date
+                                );
+                            }
+                        } else {
+                            delayed.push(ScheduledTask::new(task, config.retry_delay, 1));
+                        }
                     }
                 }
             }
@@ -290,7 +317,29 @@ pub async fn run_with_stages(
                     DownloadStageResult::Failed { reason } => {
                         cleanup_raw_artifacts(&config.paths, &task)?;
                         persist_download_failure(&task, &reason)?;
-                        delayed.push(ScheduledTask::new(task, config.retry_delay));
+                        if delayed.iter().any(|s| s.task == task) {
+                            let next_retries = delayed
+                                .iter()
+                                .find(|s| s.task == task)
+                                .map(|s| s.retries)
+                                .unwrap_or(0);
+                            if next_retries < config.max_retries {
+                                delayed.retain(|s| s.task != task);
+                                delayed
+                                    .push(ScheduledTask::new(task, config.retry_delay, next_retries + 1));
+                            } else {
+                                delayed.retain(|s| s.task != task);
+                                startup.remaining = startup.remaining.saturating_sub(1);
+                                report.failed_count += 1;
+                                tracing::error!(
+                                    "下载重试耗尽 {} {}: {reason}",
+                                    task.symbol,
+                                    task.date
+                                );
+                            }
+                        } else {
+                            delayed.push(ScheduledTask::new(task, config.retry_delay, 1));
+                        }
                     }
                 }
             }
@@ -497,6 +546,7 @@ mod tests {
             raw_check_interval: Duration::from_millis(1),
             retry_delay: Duration::ZERO,
             dl_retries: 0,
+            max_retries: 3,
         }
     }
 
