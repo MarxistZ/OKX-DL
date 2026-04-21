@@ -46,7 +46,7 @@ pub struct OkxRecord {
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     pub ts_ms:  i64,
     pub bid_px: [f32; DEPTH],

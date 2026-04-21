@@ -18,6 +18,79 @@ use std::sync::Arc;
 
 // ── 单日 LOB 重建 ────────────────────────────────────────────────────────────
 
+fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
+    let mut lob = Lob::new();
+    let mut snaps = Vec::with_capacity(900_000);
+    let mut next_sample_ms: Option<i64> = None;
+    let mut saw_snapshot = false;
+    let mut bad_lines = 0usize;
+    let mut total_lines = 0usize;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) if !line.is_empty() => line,
+            _ => continue,
+        };
+        total_lines += 1;
+
+        let record: OkxRecord = match serde_json::from_str(&line) {
+            Ok(record) => record,
+            Err(_) => {
+                bad_lines += 1;
+                continue;
+            }
+        };
+
+        match record.action.as_str() {
+            "snapshot" => {
+                lob.apply(&record);
+                saw_snapshot = lob.ready;
+            }
+            "update" if !saw_snapshot => anyhow::bail!("first valid record must be snapshot"),
+            "update" => lob.apply(&record),
+            _ => continue,
+        }
+
+        if !lob.ready {
+            continue;
+        }
+
+        let ts = lob.ts_ms;
+        let next = next_sample_ms.get_or_insert_with(|| (ts / SAMPLE_MS + 1) * SAMPLE_MS);
+        while ts >= *next {
+            snaps.push(lob.snapshot(*next));
+            *next += SAMPLE_MS;
+        }
+    }
+
+    if !saw_snapshot {
+        anyhow::bail!("no snapshot found in daily file");
+    }
+
+    if bad_lines > 0 && total_lines > 0 {
+        let pct = bad_lines as f64 / total_lines as f64 * 100.0;
+        if pct > 1.0 {
+            tracing::warn!("坏行 {bad_lines}/{total_lines} ({pct:.1}%)");
+        }
+    }
+
+    Ok(snaps)
+}
+
+pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
+    let file = std::fs::File::open(raw)?;
+    let gz = GzDecoder::new(file);
+    let mut ar = tar::Archive::new(gz);
+
+    let mut entries = ar.entries()?;
+    let entry = entries
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("tar 为空"))??;
+
+    let reader = BufReader::with_capacity(4 * 1024 * 1024, entry);
+    process_json_lines(reader)
+}
+
 /// 从 raw tar.gz 重建 LOB，采样每 100ms 快照。
 /// lob 状态跨调用保持（跨日连续）。
 /// 返回采样结果（可能为空），或解析错误。
@@ -345,4 +418,32 @@ pub fn process_symbol(symbol: &str, start: NaiveDate, end: NaiveDate, mp: &Multi
     }
 
     pbar.finish_with_message(format!("{symbol} 完成，新增 {new_rows} 行"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn process_json_lines_requires_snapshot_before_update() {
+        let input = Cursor::new(
+            "{\"action\":\"update\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[]}\n"
+        );
+
+        let err = process_json_lines(input).unwrap_err();
+        assert!(err.to_string().contains("snapshot"));
+    }
+
+    #[test]
+    fn process_json_lines_parses_one_day_independently() {
+        let input = Cursor::new(concat!(
+            "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+            "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"3\"]],\"asks\":[]}\n"
+        ));
+
+        let snaps = process_json_lines(input).unwrap();
+        assert!(!snaps.is_empty());
+        assert_eq!(snaps[0].bid_px[0], 100.0);
+    }
 }
