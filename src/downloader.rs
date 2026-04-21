@@ -1,8 +1,7 @@
-use crate::ledger::{load_day, mutate_day, DayState, DownloadState};
-use crate::{date_range, file_url, raw_path};
+use crate::pipeline::{Paths, Task};
+use crate::file_url;
 use anyhow::Result;
 use bytes::Bytes;
-use chrono::NaiveDate;
 use flate2::read::GzDecoder;
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -12,6 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
+
+#[cfg(test)]
+use crate::ledger::{load_day, mutate_day, DayState, DownloadState};
+#[cfg(test)]
+use crate::{date_range, raw_path};
+#[cfg(test)]
+use chrono::NaiveDate;
 
 // ── 下载单文件（含重试 + 指数退避） ──────────────────────────────────────────
 
@@ -155,6 +161,8 @@ async fn download_file(
 
 // ── 下载单个 (symbol, date) 任务 ─────────────────────────────────────────────
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn download_one(
     client: Arc<Client>,
     task: DownloadTask,
@@ -204,12 +212,59 @@ async fn download_one(
 }
 
 #[derive(Debug, Clone)]
+pub enum DownloadStageResult {
+    Success,
+    NotAvailable,
+    Failed { reason: String },
+}
+
+pub async fn download_stage(
+    client: Arc<Client>,
+    task: &Task,
+    paths: &Paths,
+    mp: &MultiProgress,
+    retries: u32,
+) -> DownloadStageResult {
+    let out = paths.raw_path(&task.symbol, task.date);
+
+    if let Some(parent) = out.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    let url = file_url(&task.symbol, task.date);
+    let label = format!("{} {}", task.symbol, task.date);
+    let pbar = mp.add(ProgressBar::new(0));
+    pbar.set_style(
+        ProgressStyle::default_bar()
+            .template("  {msg:25} [{bar:25}] {bytes:>9}/{total_bytes:>9} {bytes_per_sec:>10}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pbar.set_message(label);
+
+    let result = match download_file(&client, &url, &out, &pbar, retries).await {
+        Ok(true) => DownloadStageResult::Success,
+        Ok(false) => DownloadStageResult::NotAvailable,
+        Err(err) => DownloadStageResult::Failed {
+            reason: err.to_string(),
+        },
+    };
+
+    pbar.finish_and_clear();
+    result
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DownloadTask {
     pub symbol: String,
     pub date: NaiveDate,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum DownloadResult {
     Skipped,
     Success,
@@ -217,16 +272,22 @@ pub enum DownloadResult {
     Failed { reason: String },
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl DownloadResult {
     pub fn is_real_failure(&self) -> bool {
         matches!(self, Self::Failed { .. })
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn should_skip_download(state: &DayState, raw_exists: bool) -> bool {
     state.can_skip_download(raw_exists)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn persist_download_result(task: &DownloadTask, result: &DownloadResult) {
     let persisted = mutate_day(&task.symbol, task.date, |state| {
         match result {
@@ -264,6 +325,8 @@ fn persist_download_result(task: &DownloadTask, result: &DownloadResult) {
 
 // ── 批量下载入口 ──────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub async fn download_all(
     symbols: &[String],
     start: NaiveDate,

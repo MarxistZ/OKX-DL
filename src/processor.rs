@@ -1,12 +1,10 @@
-use crate::ledger::{load_day, mutate_day, DayState, DownloadState, ProcessState};
 use crate::lob::{Lob, OkxRecord, Snapshot};
-use crate::{date_range, parquet_path, raw_path, DEPTH, SAMPLE_MS};
+use crate::pipeline::{Paths, Task};
+use crate::{DEPTH, SAMPLE_MS};
 use anyhow::Result;
 use arrow::array::{ArrayRef, Float32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
-use clap::ValueEnum;
 use flate2::read::GzDecoder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -15,6 +13,15 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(test)]
+use crate::ledger::{load_day, mutate_day, DayState, DownloadState, ProcessState};
+#[cfg(test)]
+use crate::{date_range, parquet_path, raw_path};
+#[cfg(test)]
+use chrono::NaiveDate;
+#[cfg(test)]
+use clap::ValueEnum;
 
 // ── 单日 LOB 重建 ────────────────────────────────────────────────────────────
 
@@ -337,31 +344,47 @@ fn validate_parquet(path: &Path, expected_rows: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ProcessTask {
     pub symbol: String,
     pub date: NaiveDate,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(dead_code)]
 pub enum RawRetention {
     Keep,
     Delete,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ProcessResult {
     Skipped,
     Success,
     Failed { reason: String },
 }
 
+#[derive(Debug, Clone)]
+pub enum ProcessStageResult {
+    Success { rows: usize },
+    Failed { reason: String },
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn should_process_day(state: &DayState, raw_exists: bool, parquet_exists: bool) -> bool {
     state.download == DownloadState::Success
         && raw_exists
         && !(state.process == ProcessState::Success && parquet_exists)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn persist_process_failure(task: &ProcessTask, reason: &str) {
     let persisted = mutate_day(&task.symbol, task.date, |state| {
         state.process = ProcessState::Failed;
@@ -379,6 +402,8 @@ fn persist_process_failure(task: &ProcessTask, reason: &str) {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn persist_process_success(task: &ProcessTask, rows: usize, raw_deleted: bool) {
     let persisted = mutate_day(&task.symbol, task.date, |state| {
         state.process = ProcessState::Success;
@@ -398,6 +423,8 @@ fn persist_process_success(task: &ProcessTask, rows: usize, raw_deleted: bool) {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn collect_process_tasks(
     symbols: &[String],
     start: NaiveDate,
@@ -422,6 +449,8 @@ pub fn collect_process_tasks(
     tasks
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn process_day_task(task: &ProcessTask, raw_retention: RawRetention) -> ProcessResult {
     let raw = raw_path(&task.symbol, task.date);
     let out = parquet_path(&task.symbol, task.date);
@@ -475,6 +504,37 @@ pub fn process_day_task(task: &ProcessTask, raw_retention: RawRetention) -> Proc
     persist_process_success(task, rows, raw_deleted);
 
     ProcessResult::Success
+}
+
+pub fn process_stage(task: &Task, paths: &Paths) -> ProcessStageResult {
+    let raw = paths.raw_path(&task.symbol, task.date);
+    let out = paths.parquet_path(&task.symbol, task.date);
+    let schema = make_schema();
+
+    if !raw.exists() {
+        return ProcessStageResult::Failed {
+            reason: "raw file missing".to_string(),
+        };
+    }
+
+    let rows = match process_archive_to_parquet_with_batch_size(&raw, &out, &schema, SNAPSHOT_BATCH_SIZE)
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            return ProcessStageResult::Failed {
+                reason: err.to_string(),
+            }
+        }
+    };
+
+    if let Err(err) = validate_parquet(&out, rows) {
+        let _ = std::fs::remove_file(&out);
+        return ProcessStageResult::Failed {
+            reason: err.to_string(),
+        };
+    }
+
+    ProcessStageResult::Success { rows }
 }
 
 #[cfg(test)]
