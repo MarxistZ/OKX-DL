@@ -13,14 +13,13 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ── 单日 LOB 重建 ────────────────────────────────────────────────────────────
 
 struct DaySampler {
     lob: Lob,
-    snaps: Vec<Snapshot>,
     next_sample_ms: Option<i64>,
     saw_snapshot: bool,
     bad_lines: usize,
@@ -31,7 +30,6 @@ impl DaySampler {
     fn new() -> Self {
         Self {
             lob: Lob::new(),
-            snaps: Vec::with_capacity(900_000),
             next_sample_ms: None,
             saw_snapshot: false,
             bad_lines: 0,
@@ -39,7 +37,11 @@ impl DaySampler {
         }
     }
 
-    fn feed_reader<R: BufRead>(&mut self, reader: R) -> Result<()> {
+    fn feed_reader<R, F>(&mut self, reader: R, on_snapshot: &mut F) -> Result<()>
+    where
+        R: BufRead,
+        F: FnMut(Snapshot) -> Result<()>,
+    {
         for line in reader.lines() {
             let line = match line {
                 Ok(line) if !line.is_empty() => line,
@@ -57,11 +59,13 @@ impl DaySampler {
 
             match record.action.as_str() {
                 "snapshot" => {
-                    self.lob.apply(&record);
+                    self.lob.apply(&record)?;
                     self.saw_snapshot = self.lob.ready;
                 }
-                "update" if !self.saw_snapshot => anyhow::bail!("first valid record must be snapshot"),
-                "update" => self.lob.apply(&record),
+                "update" if !self.saw_snapshot => {
+                    anyhow::bail!("first valid record must be snapshot")
+                }
+                "update" => self.lob.apply(&record)?,
                 _ => continue,
             }
 
@@ -74,7 +78,7 @@ impl DaySampler {
                 .next_sample_ms
                 .get_or_insert_with(|| (ts / SAMPLE_MS + 1) * SAMPLE_MS);
             while ts >= *next {
-                self.snaps.push(self.lob.snapshot(*next));
+                on_snapshot(self.lob.snapshot(*next))?;
                 *next += SAMPLE_MS;
             }
         }
@@ -82,7 +86,7 @@ impl DaySampler {
         Ok(())
     }
 
-    fn finish(self) -> Result<Vec<Snapshot>> {
+    fn finish(&self) -> Result<()> {
         if !self.saw_snapshot {
             anyhow::bail!("no snapshot found in daily file");
         }
@@ -94,17 +98,14 @@ impl DaySampler {
             }
         }
 
-        Ok(self.snaps)
+        Ok(())
     }
 }
 
-fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
-    let mut sampler = DaySampler::new();
-    sampler.feed_reader(reader)?;
-    sampler.finish()
-}
-
-pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
+fn process_archive_entries<F>(raw: &Path, mut on_snapshot: F) -> Result<()>
+where
+    F: FnMut(Snapshot) -> Result<()>,
+{
     let file = std::fs::File::open(raw)?;
     let gz = GzDecoder::new(file);
     let mut ar = tar::Archive::new(gz);
@@ -120,13 +121,35 @@ pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
         }
 
         let reader = BufReader::with_capacity(4 * 1024 * 1024, entry);
-        sampler.feed_reader(reader)?;
+        sampler.feed_reader(reader, &mut on_snapshot)?;
     }
 
     sampler.finish()
 }
 
+fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
+    let mut sampler = DaySampler::new();
+    let mut snaps = Vec::new();
+    sampler.feed_reader(reader, &mut |snapshot| {
+        snaps.push(snapshot);
+        Ok(())
+    })?;
+    sampler.finish()?;
+    Ok(snaps)
+}
+
+pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
+    let mut snaps = Vec::new();
+    process_archive_entries(raw, |snapshot| {
+        snaps.push(snapshot);
+        Ok(())
+    })?;
+    Ok(snaps)
+}
+
 // ── Parquet 写入 + 验证 ───────────────────────────────────────────────────────
+
+const SNAPSHOT_BATCH_SIZE: usize = 10_000;
 
 fn make_schema() -> Arc<Schema> {
     let mut fields = vec![Field::new("timestamp_ms", DataType::Int64, false)];
@@ -141,12 +164,7 @@ fn make_schema() -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
-fn write_parquet(path: &Path, snaps: &[Snapshot], schema: &Arc<Schema>) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
+fn build_record_batch(snaps: &[Snapshot], schema: &Arc<Schema>) -> Result<RecordBatch> {
     let ts: Int64Array = snaps.iter().map(|s| s.ts_ms).collect();
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(ts)];
 
@@ -203,18 +221,101 @@ fn write_parquet(path: &Path, snaps: &[Snapshot], schema: &Arc<Schema>) -> Resul
         arrays.push(Arc::new(sz));
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    let file = std::fs::File::create(&tmp)?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
+    RecordBatch::try_new(schema.clone(), arrays).map_err(Into::into)
+}
 
-    // 原子 rename
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+struct SnapshotBatchWriter {
+    path: PathBuf,
+    tmp: PathBuf,
+    writer: Option<ArrowWriter<std::fs::File>>,
+    schema: Arc<Schema>,
+    pending: Vec<Snapshot>,
+    batch_size: usize,
+    rows_written: usize,
+}
+
+impl SnapshotBatchWriter {
+    fn new(path: &Path, schema: &Arc<Schema>, batch_size: usize) -> Result<Self> {
+        let tmp = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let file = std::fs::File::create(&tmp)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            tmp,
+            writer: Some(writer),
+            schema: schema.clone(),
+            pending: Vec::with_capacity(batch_size.max(1)),
+            batch_size: batch_size.max(1),
+            rows_written: 0,
+        })
+    }
+
+    fn push(&mut self, snapshot: Snapshot) -> Result<()> {
+        self.pending.push(snapshot);
+        if self.pending.len() >= self.batch_size {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let batch = build_record_batch(&self.pending, &self.schema)?;
+        self.writer
+            .as_mut()
+            .expect("writer should exist before finish")
+            .write(&batch)?;
+        self.rows_written += self.pending.len();
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<usize> {
+        self.flush()?;
+        self.writer
+            .take()
+            .expect("writer should exist before finish")
+            .close()?;
+        std::fs::rename(&self.tmp, &self.path)?;
+        Ok(self.rows_written)
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+fn process_archive_to_parquet_with_batch_size(
+    raw: &Path,
+    out: &Path,
+    schema: &Arc<Schema>,
+    batch_size: usize,
+) -> Result<usize> {
+    let mut writer = SnapshotBatchWriter::new(out, schema, batch_size)?;
+    let result = process_archive_entries(raw, |snapshot| writer.push(snapshot)).and_then(|_| {
+        let rows = writer.finish()?;
+        if rows == 0 {
+            anyhow::bail!("no snapshots produced");
+        }
+        Ok(rows)
+    });
+
+    if result.is_err() {
+        writer.cleanup();
+    }
+
+    result
 }
 
 fn validate_parquet(path: &Path, expected_rows: usize) -> Result<()> {
@@ -340,14 +441,13 @@ pub fn process_day_task(task: &ProcessTask, raw_retention: RawRetention) -> Proc
         };
     }
 
-    let snaps = match process_day_archive(&raw) {
-        Ok(snaps) if !snaps.is_empty() => snaps,
-        Ok(_) => {
-            persist_process_failure(task, "no snapshots produced");
-            return ProcessResult::Failed {
-                reason: "no snapshots produced".to_string(),
-            };
-        }
+    let rows = match process_archive_to_parquet_with_batch_size(
+        &raw,
+        &out,
+        &schema,
+        SNAPSHOT_BATCH_SIZE,
+    ) {
+        Ok(rows) => rows,
         Err(err) => {
             let reason = err.to_string();
             persist_process_failure(task, &reason);
@@ -357,9 +457,7 @@ pub fn process_day_task(task: &ProcessTask, raw_retention: RawRetention) -> Proc
         }
     };
 
-    if let Err(err) =
-        write_parquet(&out, &snaps, &schema).and_then(|_| validate_parquet(&out, snaps.len()))
-    {
+    if let Err(err) = validate_parquet(&out, rows) {
         let reason = err.to_string();
         let _ = std::fs::remove_file(&out);
         persist_process_failure(task, &reason);
@@ -372,7 +470,7 @@ pub fn process_day_task(task: &ProcessTask, raw_retention: RawRetention) -> Proc
         RawRetention::Keep => false,
         RawRetention::Delete => std::fs::remove_file(&raw).is_ok(),
     };
-    persist_process_success(task, snaps.len(), raw_deleted);
+    persist_process_success(task, rows, raw_deleted);
 
     ProcessResult::Success
 }
@@ -466,6 +564,59 @@ mod tests {
 
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].bid_sz[0], 3.0);
+        cleanup_symbol(&symbol);
+    }
+
+    #[test]
+    fn process_day_archive_writes_expected_rows_with_small_batch_size() {
+        let symbol = unique_symbol("chunked-parquet");
+        let d = NaiveDate::from_ymd_opt(2024, 1, 8).unwrap();
+        let raw = crate::raw_path(&symbol, d);
+        let out = crate::parquet_path(&symbol, d);
+        let schema = make_schema();
+
+        write_archive(
+            &raw,
+            &[(
+                "day.json",
+                concat!(
+                    "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+                    "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"2\"]],\"asks\":[]}\n",
+                    "{\"action\":\"update\",\"ts\":\"1200\",\"bids\":[[\"100\",\"3\"]],\"asks\":[]}\n"
+                ),
+            )],
+        );
+
+        let rows = process_archive_to_parquet_with_batch_size(&raw, &out, &schema, 1).unwrap();
+
+        assert_eq!(rows, 2);
+        validate_parquet(&out, rows).unwrap();
+        cleanup_symbol(&symbol);
+    }
+
+    #[test]
+    fn processing_fails_on_timestamp_regression() {
+        let symbol = unique_symbol("timestamp-regression");
+        let d = NaiveDate::from_ymd_opt(2024, 1, 9).unwrap();
+        let raw = crate::raw_path(&symbol, d);
+        let out = crate::parquet_path(&symbol, d);
+        let schema = make_schema();
+
+        write_archive(
+            &raw,
+            &[(
+                "day.json",
+                concat!(
+                    "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+                    "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"2\"]],\"asks\":[]}\n",
+                    "{\"action\":\"update\",\"ts\":\"1099\",\"bids\":[[\"100\",\"3\"]],\"asks\":[]}\n"
+                ),
+            )],
+        );
+
+        let err = process_archive_to_parquet_with_batch_size(&raw, &out, &schema, 2).unwrap_err();
+
+        assert!(err.to_string().contains("1099"));
         cleanup_symbol(&symbol);
     }
 }

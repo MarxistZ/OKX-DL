@@ -1,4 +1,5 @@
 use crate::DEPTH;
+use anyhow::Result;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -86,11 +87,14 @@ impl Lob {
         }
     }
 
-    pub fn apply(&mut self, record: &OkxRecord) {
+    pub fn apply(&mut self, record: &OkxRecord) -> Result<()> {
         let ts = record.ts.parse::<i64>().unwrap_or(self.ts_ms);
-        // 容错：拒绝时间戳倒退超过 1 分钟的 update（可能是乱序数据）
-        if ts < self.ts_ms - 60_000 && self.ready {
-            return;
+        if self.ready && ts < self.ts_ms {
+            anyhow::bail!(
+                "timestamp regression: record ts {} is older than current {}",
+                ts,
+                self.ts_ms
+            );
         }
         self.ts_ms = ts;
 
@@ -165,6 +169,8 @@ impl Lob {
             }
             _ => {}
         }
+
+        Ok(())
     }
 
     /// top-DEPTH 快照，O(DEPTH)
@@ -186,10 +192,10 @@ impl Lob {
 mod tests {
     use super::*;
 
-    fn snapshot(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
+    fn record(action: &str, ts: &str, bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
         OkxRecord {
-            action: "snapshot".to_string(),
-            ts: "1000".to_string(),
+            action: action.to_string(),
+            ts: ts.to_string(),
             bids: bids
                 .iter()
                 .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
@@ -201,19 +207,16 @@ mod tests {
         }
     }
 
+    fn snapshot(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
+        record("snapshot", "1000", bids, asks)
+    }
+
     fn update(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
-        OkxRecord {
-            action: "update".to_string(),
-            ts: "1100".to_string(),
-            bids: bids
-                .iter()
-                .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
-                .collect(),
-            asks: asks
-                .iter()
-                .map(|(px, sz)| vec![(*px).to_string(), (*sz).to_string()])
-                .collect(),
-        }
+        record("update", "1100", bids, asks)
+    }
+
+    fn update_at(ts: &str, bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OkxRecord {
+        record("update", ts, bids, asks)
     }
 
     #[test]
@@ -222,7 +225,8 @@ mod tests {
         lob.apply(&snapshot(
             &[("bad", "1"), ("100.5", "2")],
             &[("101.0", "3")],
-        ));
+        ))
+        .unwrap();
 
         let snap = lob.snapshot(1000);
         assert_eq!(snap.bid_px[0], 100.5);
@@ -232,10 +236,41 @@ mod tests {
     #[test]
     fn update_zero_quantity_removes_existing_level() {
         let mut lob = Lob::new();
-        lob.apply(&snapshot(&[("100.5", "2")], &[("101.0", "3")]));
-        lob.apply(&update(&[("100.5", "0")], &[]));
+        lob.apply(&snapshot(&[("100.5", "2")], &[("101.0", "3")]))
+            .unwrap();
+        lob.apply(&update(&[("100.5", "0")], &[])).unwrap();
 
         let snap = lob.snapshot(1100);
         assert!(snap.bid_px[0].is_nan());
+    }
+
+    #[test]
+    fn update_rejects_older_timestamp() {
+        let mut lob = Lob::new();
+        lob.apply(&snapshot(&[("100.5", "2")], &[("101.0", "3")]))
+            .unwrap();
+        lob.apply(&update_at("1100", &[("100.5", "4")], &[]))
+            .unwrap();
+
+        let err = lob
+            .apply(&update_at("1099", &[("100.5", "5")], &[]))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("1099"));
+        assert!(msg.contains("1100"));
+    }
+
+    #[test]
+    fn equal_timestamp_update_is_allowed() {
+        let mut lob = Lob::new();
+        lob.apply(&snapshot(&[("100.5", "2")], &[("101.0", "3")]))
+            .unwrap();
+        lob.apply(&update_at("1100", &[("100.5", "4")], &[]))
+            .unwrap();
+        lob.apply(&update_at("1100", &[("100.5", "5")], &[]))
+            .unwrap();
+
+        let snap = lob.snapshot(1100);
+        assert_eq!(snap.bid_sz[0], 5.0);
     }
 }
