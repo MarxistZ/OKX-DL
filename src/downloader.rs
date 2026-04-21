@@ -1,4 +1,4 @@
-use crate::ledger::{load_day, save_day, utc_now_rfc3339, DayState, DownloadState};
+use crate::ledger::{load_day, mutate_day, DayState, DownloadState};
 use crate::{date_range, file_url, raw_path};
 use anyhow::Result;
 use bytes::Bytes;
@@ -183,6 +183,41 @@ fn should_skip_download(state: &DayState, raw_exists: bool) -> bool {
     state.can_skip_download(raw_exists)
 }
 
+fn persist_download_result(task: &DownloadTask, result: &DownloadResult) {
+    let persisted = mutate_day(&task.symbol, task.date, |state| {
+        match result {
+            DownloadResult::Success => {
+                state.download = DownloadState::Success;
+                state.download_attempts += 1;
+                state.raw_deleted = false;
+                state.last_error = None;
+            }
+            DownloadResult::NotAvailable => {
+                state.download = DownloadState::NotAvailable;
+                state.download_attempts += 1;
+                state.raw_deleted = false;
+                state.last_error = None;
+            }
+            DownloadResult::Failed { reason } => {
+                state.download = DownloadState::Failed;
+                state.download_attempts += 1;
+                state.raw_deleted = false;
+                state.last_error = Some(reason.clone());
+            }
+            DownloadResult::Skipped => {}
+        }
+        Ok(())
+    });
+
+    if let Err(err) = persisted {
+        tracing::warn!(
+            "写入下载 ledger 失败 {} {}: {err}",
+            task.symbol,
+            task.date
+        );
+    }
+}
+
 // ── 批量下载入口 ──────────────────────────────────────────────────────────────
 
 pub async fn download_all(
@@ -226,7 +261,7 @@ pub async fn download_all(
         let total_bar = total_bar.clone();
         async move {
             let raw = raw_path(&task.symbol, task.date);
-            let mut state = load_day(&task.symbol, task.date);
+            let state = load_day(&task.symbol, task.date);
 
             if should_skip_download(&state, raw.exists()) {
                 total_bar.inc(1);
@@ -235,32 +270,8 @@ pub async fn download_all(
 
             let (task, result) = download_one(client, task, total_bar, mp, retries).await;
 
-            match &result {
-                DownloadResult::Success => {
-                    state.download = DownloadState::Success;
-                    state.download_attempts += 1;
-                    state.raw_present = true;
-                    state.last_error = None;
-                }
-                DownloadResult::NotAvailable => {
-                    state.download = DownloadState::NotAvailable;
-                    state.download_attempts += 1;
-                    state.raw_present = false;
-                    state.last_error = None;
-                }
-                DownloadResult::Failed { reason } => {
-                    state.download = DownloadState::Failed;
-                    state.download_attempts += 1;
-                    state.raw_present = false;
-                    state.last_error = Some(reason.clone());
-                }
-                DownloadResult::Skipped => {}
-            }
-
             if !matches!(result, DownloadResult::Skipped) {
-                state.sync_legacy_flags();
-                state.updated_at = utc_now_rfc3339();
-                let _ = save_day(&task.symbol, task.date, &state);
+                persist_download_result(&task, &result);
             }
 
             (task, result)

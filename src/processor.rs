@@ -1,4 +1,4 @@
-use crate::ledger::{load_day, save_day, utc_now_rfc3339, DayState, DownloadState, ProcessState};
+use crate::ledger::{load_day, mutate_day, DayState, DownloadState, ProcessState};
 use crate::lob::{Lob, OkxRecord, Snapshot};
 use crate::{date_range, parquet_path, raw_path, DEPTH, SAMPLE_MS};
 use anyhow::Result;
@@ -214,6 +214,42 @@ pub fn should_process_day(state: &DayState, raw_exists: bool, parquet_exists: bo
         && !(state.process == ProcessState::Success && parquet_exists)
 }
 
+fn persist_process_failure(task: &ProcessTask, reason: &str) {
+    let persisted = mutate_day(&task.symbol, task.date, |state| {
+        state.process = ProcessState::Failed;
+        state.process_attempts += 1;
+        state.last_error = Some(reason.to_string());
+        Ok(())
+    });
+
+    if let Err(err) = persisted {
+        tracing::warn!(
+            "写入处理失败 ledger 失败 {} {}: {err}",
+            task.symbol,
+            task.date
+        );
+    }
+}
+
+fn persist_process_success(task: &ProcessTask, rows: usize, raw_deleted: bool) {
+    let persisted = mutate_day(&task.symbol, task.date, |state| {
+        state.process = ProcessState::Success;
+        state.process_attempts += 1;
+        state.rows = Some(rows);
+        state.raw_deleted = raw_deleted;
+        state.last_error = None;
+        Ok(())
+    });
+
+    if let Err(err) = persisted {
+        tracing::warn!(
+            "写入处理成功 ledger 失败 {} {}: {err}",
+            task.symbol,
+            task.date
+        );
+    }
+}
+
 pub fn collect_process_tasks(
     symbols: &[String],
     start: NaiveDate,
@@ -242,7 +278,7 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
     let raw = raw_path(&task.symbol, task.date);
     let out = parquet_path(&task.symbol, task.date);
     let schema = make_schema();
-    let mut state = load_day(&task.symbol, task.date);
+    let state = load_day(&task.symbol, task.date);
 
     if state.download == DownloadState::NotAvailable {
         return ProcessResult::Skipped;
@@ -253,11 +289,7 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
     }
 
     if !raw.exists() {
-        state.process = ProcessState::Failed;
-        state.process_attempts += 1;
-        state.last_error = Some("raw file missing".to_string());
-        state.sync_legacy_flags();
-        let _ = save_day(&task.symbol, task.date, &state);
+        persist_process_failure(task, "raw file missing");
         return ProcessResult::Failed {
             reason: "raw file missing".to_string(),
         };
@@ -266,23 +298,16 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
     let snaps = match process_day_archive(&raw) {
         Ok(snaps) if !snaps.is_empty() => snaps,
         Ok(_) => {
-            state.process = ProcessState::Failed;
-            state.process_attempts += 1;
-            state.last_error = Some("no snapshots produced".to_string());
-            state.sync_legacy_flags();
-            let _ = save_day(&task.symbol, task.date, &state);
+            persist_process_failure(task, "no snapshots produced");
             return ProcessResult::Failed {
                 reason: "no snapshots produced".to_string(),
             };
         }
         Err(err) => {
-            state.process = ProcessState::Failed;
-            state.process_attempts += 1;
-            state.last_error = Some(err.to_string());
-            state.sync_legacy_flags();
-            let _ = save_day(&task.symbol, task.date, &state);
+            let reason = err.to_string();
+            persist_process_failure(task, &reason);
             return ProcessResult::Failed {
-                reason: err.to_string(),
+                reason,
             };
         }
     };
@@ -290,29 +315,16 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
     if let Err(err) =
         write_parquet(&out, &snaps, &schema).and_then(|_| validate_parquet(&out, snaps.len()))
     {
-        state.process = ProcessState::Failed;
-        state.process_attempts += 1;
-        state.last_error = Some(err.to_string());
-        state.sync_legacy_flags();
+        let reason = err.to_string();
         let _ = std::fs::remove_file(&out);
-        let _ = save_day(&task.symbol, task.date, &state);
+        persist_process_failure(task, &reason);
         return ProcessResult::Failed {
-            reason: err.to_string(),
+            reason,
         };
     }
 
-    state.process = ProcessState::Success;
-    state.process_attempts += 1;
-    state.rows = Some(snaps.len());
-    state.parquet_present = true;
-    state.last_error = None;
-    state.updated_at = utc_now_rfc3339();
-
     let raw_deleted = std::fs::remove_file(&raw).is_ok();
-    state.raw_present = !raw_deleted;
-    state.raw_deleted = raw_deleted;
-    state.sync_legacy_flags();
-    let _ = save_day(&task.symbol, task.date, &state);
+    persist_process_success(task, snaps.len(), raw_deleted);
 
     ProcessResult::Success
 }
