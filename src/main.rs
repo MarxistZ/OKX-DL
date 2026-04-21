@@ -78,6 +78,20 @@ pub fn date_range(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
     v
 }
 
+fn validate_date_bounds(start: NaiveDate, end: NaiveDate) -> Result<()> {
+    if end < start {
+        anyhow::bail!("invalid date range: --end {end} is before --start {start}");
+    }
+    Ok(())
+}
+
+fn build_process_pool(workers: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers.max(1))
+        .build()
+        .map_err(Into::into)
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -170,6 +184,7 @@ fn main() -> Result<()> {
         Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")?,
         None => chrono::Local::now().date_naive(),
     };
+    validate_date_bounds(start, end)?;
     let symbols: Vec<String> = match &cli.symbol {
         Some(s) => vec![s.clone()],
         None => all_symbols(),
@@ -237,16 +252,10 @@ fn main() -> Result<()> {
 
     if !cli.download_only {
         tracing::info!("=== 处理阶段 ===");
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build_global()
-            .ok();
-
         let process_tasks = processor::collect_process_tasks(&symbols, start, end);
-        let process_results: Vec<_> = process_tasks
-            .par_iter()
-            .map(processor::process_day_task)
-            .collect();
+        let pool = build_process_pool(workers)?;
+        let process_results: Vec<_> =
+            pool.install(|| process_tasks.par_iter().map(processor::process_day_task).collect());
 
         for (task, result) in process_tasks.into_iter().zip(process_results.into_iter()) {
             if let processor::ProcessResult::Failed { reason } = result {
@@ -302,5 +311,31 @@ mod tests {
         };
 
         assert!(summary.has_real_failures());
+    }
+
+    #[test]
+    fn validate_date_bounds_rejects_end_before_start() {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+
+        let err = validate_date_bounds(start, end).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2025-01-01"));
+        assert!(msg.contains("2024-01-01"));
+    }
+
+    #[test]
+    fn validate_date_bounds_accepts_equal_dates() {
+        let day = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        validate_date_bounds(day, day).unwrap();
+    }
+
+    #[test]
+    fn build_process_pool_can_be_called_twice() {
+        let first = build_process_pool(1).unwrap();
+        let second = build_process_pool(1).unwrap();
+
+        first.install(|| assert_eq!(rayon::current_num_threads(), 1));
+        second.install(|| assert_eq!(rayon::current_num_threads(), 1));
     }
 }
