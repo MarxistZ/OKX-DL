@@ -45,8 +45,10 @@ pub fn parquet_path(symbol: &str, d: NaiveDate) -> PathBuf {
 pub fn checkpoint_path(symbol: &str, d: NaiveDate) -> PathBuf {
     checkpoint_dir().join(symbol).join(format!("{}.json", d.format("%Y-%m-%d")))
 }
-pub fn ledger_path(symbol: &str) -> PathBuf {
-    ledger_dir().join(format!("{symbol}.json"))
+pub fn ledger_path(symbol: &str, d: NaiveDate) -> PathBuf {
+    ledger_dir()
+        .join(symbol)
+        .join(format!("{}.json", d.format("%Y-%m-%d")))
 }
 pub fn file_url(symbol: &str, d: NaiveDate) -> String {
     format!(
