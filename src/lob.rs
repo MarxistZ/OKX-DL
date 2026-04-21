@@ -48,7 +48,7 @@ pub struct OkxRecord {
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    pub ts_ms:  i64,
+    pub ts_ms: i64,
     pub bid_px: [f32; DEPTH],
     pub bid_sz: [f32; DEPTH],
     pub ask_px: [f32; DEPTH],
@@ -72,8 +72,8 @@ impl Snapshot {
 /// bids: key = -encoded_price（BTreeMap 升序 ⟹ 第一个是最高 bid）
 /// asks: key = +encoded_price（BTreeMap 升序 ⟹ 第一个是最低 ask）
 pub struct Lob {
-    pub bids:  BTreeMap<i64, f32>,
-    pub asks:  BTreeMap<i64, f32>,
+    pub bids: BTreeMap<i64, f32>,
+    pub asks: BTreeMap<i64, f32>,
     pub ts_ms: i64,
     pub ready: bool,
 }
@@ -81,8 +81,8 @@ pub struct Lob {
 impl Lob {
     pub fn new() -> Self {
         Self {
-            bids:  BTreeMap::new(),
-            asks:  BTreeMap::new(),
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
             ts_ms: 0,
             ready: false,
         }
@@ -187,13 +187,13 @@ impl Lob {
 
     pub fn save_checkpoint(&self, path: &Path) -> Result<()> {
         let ckpt = LobCheckpoint {
-            bids:  self.bids.iter().map(|(&k, &v)| (k, v)).collect(),
-            asks:  self.asks.iter().map(|(&k, &v)| (k, v)).collect(),
+            bids: self.bids.iter().map(|(&k, &v)| (k, v)).collect(),
+            asks: self.asks.iter().map(|(&k, &v)| (k, v)).collect(),
             ts_ms: self.ts_ms,
         };
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_string(&ckpt)?)?;
-        std::fs::rename(&tmp, path)?;  // 原子写入
+        std::fs::rename(&tmp, path)?; // 原子写入
         Ok(())
     }
 
@@ -201,8 +201,12 @@ impl Lob {
         let data = std::fs::read_to_string(path)?;
         let ckpt: LobCheckpoint = serde_json::from_str(&data)?;
         let mut lob = Lob::new();
-        for (k, v) in ckpt.bids { lob.bids.insert(k, v); }
-        for (k, v) in ckpt.asks { lob.asks.insert(k, v); }
+        for (k, v) in ckpt.bids {
+            lob.bids.insert(k, v);
+        }
+        for (k, v) in ckpt.asks {
+            lob.asks.insert(k, v);
+        }
         lob.ts_ms = ckpt.ts_ms;
         lob.ready = !lob.bids.is_empty() || !lob.asks.is_empty();
         Ok(lob)
@@ -211,8 +215,8 @@ impl Lob {
 
 #[derive(Serialize, Deserialize)]
 struct LobCheckpoint {
-    bids:  Vec<(i64, f32)>,
-    asks:  Vec<(i64, f32)>,
+    bids: Vec<(i64, f32)>,
+    asks: Vec<(i64, f32)>,
     ts_ms: i64,
 }
 
@@ -253,7 +257,10 @@ mod tests {
     #[test]
     fn snapshot_ignores_invalid_price_levels() {
         let mut lob = Lob::new();
-        lob.apply(&snapshot(&[("bad", "1"), ("100.5", "2")], &[("101.0", "3")]));
+        lob.apply(&snapshot(
+            &[("bad", "1"), ("100.5", "2")],
+            &[("101.0", "3")],
+        ));
 
         let snap = lob.snapshot(1000);
         assert_eq!(snap.bid_px[0], 100.5);

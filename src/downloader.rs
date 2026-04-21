@@ -1,5 +1,5 @@
-use crate::{date_range, file_url, raw_path};
 use crate::ledger::{load_day, save_day, utc_now_rfc3339, DayState, DownloadState};
+use crate::{date_range, file_url, raw_path};
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::NaiveDate;
@@ -15,11 +15,11 @@ use tokio::time::sleep;
 
 /// 返回 Ok(true)=成功，Ok(false)=404，Err=不可恢复错误
 async fn download_file(
-    client:   &Client,
-    url:      &str,
-    out:      &std::path::Path,
-    pbar:     &ProgressBar,
-    retries:  u32,
+    client: &Client,
+    url: &str,
+    out: &std::path::Path,
+    pbar: &ProgressBar,
+    retries: u32,
 ) -> Result<bool> {
     let tmp = out.with_extension("tmp");
 
@@ -31,7 +31,7 @@ async fn download_file(
         }
 
         let resp = match client.get(url).send().await {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!("下载失败 (attempt {attempt}): {e}");
                 continue;
@@ -47,10 +47,12 @@ async fn download_file(
         }
 
         let total = resp.content_length();
-        if let Some(len) = total { pbar.set_length(len); }
+        if let Some(len) = total {
+            pbar.set_length(len);
+        }
 
         // 流式写入 .tmp
-        let mut file   = tokio::fs::File::create(&tmp).await?;
+        let mut file = tokio::fs::File::create(&tmp).await?;
         let mut stream = resp.bytes_stream();
         let mut written = 0u64;
         let mut ok = true;
@@ -110,10 +112,10 @@ async fn download_file(
 // ── 下载单个 (symbol, date) 任务 ─────────────────────────────────────────────
 
 async fn download_one(
-    client:  Arc<Client>,
-    task:    DownloadTask,
-    total:   ProgressBar,
-    mp:      MultiProgress,
+    client: Arc<Client>,
+    task: DownloadTask,
+    total: ProgressBar,
+    mp: MultiProgress,
     retries: u32,
 ) -> (DownloadTask, DownloadResult) {
     let out = raw_path(&task.symbol, task.date);
@@ -184,20 +186,22 @@ fn should_skip_download(state: &DayState, raw_exists: bool) -> bool {
 // ── 批量下载入口 ──────────────────────────────────────────────────────────────
 
 pub async fn download_all(
-    symbols:      &[String],
-    start:        NaiveDate,
-    end:          NaiveDate,
-    mp:           &MultiProgress,
-    concurrency:  usize,
-    retries:      u32,
+    symbols: &[String],
+    start: NaiveDate,
+    end: NaiveDate,
+    mp: &MultiProgress,
+    concurrency: usize,
+    retries: u32,
 ) -> Result<Vec<(DownloadTask, DownloadResult)>> {
     let tasks: Vec<DownloadTask> = symbols
         .iter()
         .flat_map(|symbol| {
-            date_range(start, end).into_iter().map(move |date| DownloadTask {
-                symbol: symbol.clone(),
-                date,
-            })
+            date_range(start, end)
+                .into_iter()
+                .map(move |date| DownloadTask {
+                    symbol: symbol.clone(),
+                    date,
+                })
         })
         .collect();
 
@@ -281,9 +285,7 @@ pub async fn download_all(
     }
 
     total_bar.finish_with_message("下载完成");
-    tracing::info!(
-        "下载结果：成功 {ok}，不存在 {not_avail}，跳过 {skipped}，失败 {failed}"
-    );
+    tracing::info!("下载结果：成功 {ok}，不存在 {not_avail}，跳过 {skipped}，失败 {failed}");
     Ok(results)
 }
 

@@ -1,5 +1,5 @@
-use crate::lob::{Lob, OkxRecord, Snapshot};
 use crate::ledger::{load_day, save_day, utc_now_rfc3339, DayState, DownloadState, ProcessState};
+use crate::lob::{Lob, OkxRecord, Snapshot};
 use crate::{date_range, parquet_path, raw_path, DEPTH, SAMPLE_MS};
 use anyhow::Result;
 use arrow::array::{ArrayRef, Float32Array, Int64Array};
@@ -112,33 +112,61 @@ fn write_parquet(path: &Path, snaps: &[Snapshot], schema: &Arc<Schema>) -> Resul
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(ts)];
 
     for i in 0..DEPTH {
-        let px: Float32Array = snaps.iter().map(|s| {
-            let v = s.bid_px[i];
-            if v.is_nan() { None } else { Some(v) }
-        }).collect();
-        let sz: Float32Array = snaps.iter().map(|s| {
-            let v = s.bid_sz[i];
-            if v.is_nan() { None } else { Some(v) }
-        }).collect();
+        let px: Float32Array = snaps
+            .iter()
+            .map(|s| {
+                let v = s.bid_px[i];
+                if v.is_nan() {
+                    None
+                } else {
+                    Some(v)
+                }
+            })
+            .collect();
+        let sz: Float32Array = snaps
+            .iter()
+            .map(|s| {
+                let v = s.bid_sz[i];
+                if v.is_nan() {
+                    None
+                } else {
+                    Some(v)
+                }
+            })
+            .collect();
         arrays.push(Arc::new(px));
         arrays.push(Arc::new(sz));
     }
     for i in 0..DEPTH {
-        let px: Float32Array = snaps.iter().map(|s| {
-            let v = s.ask_px[i];
-            if v.is_nan() { None } else { Some(v) }
-        }).collect();
-        let sz: Float32Array = snaps.iter().map(|s| {
-            let v = s.ask_sz[i];
-            if v.is_nan() { None } else { Some(v) }
-        }).collect();
+        let px: Float32Array = snaps
+            .iter()
+            .map(|s| {
+                let v = s.ask_px[i];
+                if v.is_nan() {
+                    None
+                } else {
+                    Some(v)
+                }
+            })
+            .collect();
+        let sz: Float32Array = snaps
+            .iter()
+            .map(|s| {
+                let v = s.ask_sz[i];
+                if v.is_nan() {
+                    None
+                } else {
+                    Some(v)
+                }
+            })
+            .collect();
         arrays.push(Arc::new(px));
         arrays.push(Arc::new(sz));
     }
 
-    let batch  = RecordBatch::try_new(schema.clone(), arrays)?;
-    let file   = std::fs::File::create(&tmp)?;
-    let props  = WriterProperties::builder()
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let file = std::fs::File::create(&tmp)?;
+    let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
@@ -151,7 +179,7 @@ fn write_parquet(path: &Path, snaps: &[Snapshot], schema: &Arc<Schema>) -> Resul
 }
 
 fn validate_parquet(path: &Path, expected_rows: usize) -> Result<()> {
-    let file   = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
     let actual = reader.metadata().file_metadata().num_rows() as usize;
 
@@ -186,7 +214,11 @@ pub fn should_process_day(state: &DayState, raw_exists: bool, parquet_exists: bo
         && !(state.process == ProcessState::Success && parquet_exists)
 }
 
-pub fn collect_process_tasks(symbols: &[String], start: NaiveDate, end: NaiveDate) -> Vec<ProcessTask> {
+pub fn collect_process_tasks(
+    symbols: &[String],
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Vec<ProcessTask> {
     let mut tasks = Vec::new();
 
     for symbol in symbols {
@@ -255,7 +287,9 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
         }
     };
 
-    if let Err(err) = write_parquet(&out, &snaps, &schema).and_then(|_| validate_parquet(&out, snaps.len())) {
+    if let Err(err) =
+        write_parquet(&out, &snaps, &schema).and_then(|_| validate_parquet(&out, snaps.len()))
+    {
         state.process = ProcessState::Failed;
         state.process_attempts += 1;
         state.last_error = Some(err.to_string());
@@ -294,7 +328,7 @@ mod tests {
     #[test]
     fn process_json_lines_requires_snapshot_before_update() {
         let input = Cursor::new(
-            "{\"action\":\"update\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[]}\n"
+            "{\"action\":\"update\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[]}\n",
         );
 
         let err = process_json_lines(input).unwrap_err();

@@ -15,12 +15,17 @@ use tracing_subscriber::EnvFilter;
 
 pub const DEPTH: usize = 20;
 pub const SAMPLE_MS: i64 = 100;
-pub const BASE_URL: &str =
-    "https://static.okx.com/cdn/okx/match/orderbook/L2/400lv/daily";
+pub const BASE_URL: &str = "https://static.okx.com/cdn/okx/match/orderbook/L2/400lv/daily";
 
 pub const SPOTS: &[&str] = &[
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT",
-    "XRP-USDT", "DOGE-USDT", "LINK-USDT", "AVAX-USDT",
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "BNB-USDT",
+    "XRP-USDT",
+    "DOGE-USDT",
+    "LINK-USDT",
+    "AVAX-USDT",
 ];
 
 pub fn all_symbols() -> Vec<String> {
@@ -31,15 +36,25 @@ pub fn all_symbols() -> Vec<String> {
 
 // ── 路径工具 ─────────────────────────────────────────────────────────────────
 
-pub fn raw_dir()        -> PathBuf { "data/raw".into() }
-pub fn parquet_dir()    -> PathBuf { "data/parquet".into() }
-pub fn ledger_dir()     -> PathBuf { "data/ledger".into() }
+pub fn raw_dir() -> PathBuf {
+    "data/raw".into()
+}
+pub fn parquet_dir() -> PathBuf {
+    "data/parquet".into()
+}
+pub fn ledger_dir() -> PathBuf {
+    "data/ledger".into()
+}
 
 pub fn raw_path(symbol: &str, d: NaiveDate) -> PathBuf {
-    raw_dir().join(symbol).join(format!("{}.tar.gz", d.format("%Y-%m-%d")))
+    raw_dir()
+        .join(symbol)
+        .join(format!("{}.tar.gz", d.format("%Y-%m-%d")))
 }
 pub fn parquet_path(symbol: &str, d: NaiveDate) -> PathBuf {
-    parquet_dir().join(symbol).join(format!("{}.parquet", d.format("%Y-%m-%d")))
+    parquet_dir()
+        .join(symbol)
+        .join(format!("{}.parquet", d.format("%Y-%m-%d")))
 }
 pub fn ledger_path(symbol: &str, d: NaiveDate) -> PathBuf {
     ledger_dir()
@@ -50,7 +65,7 @@ pub fn file_url(symbol: &str, d: NaiveDate) -> String {
     format!(
         "{BASE_URL}/{compact}/{symbol}-L2orderbook-400lv-{dash}.tar.gz",
         compact = d.format("%Y%m%d"),
-        dash    = d.format("%Y-%m-%d"),
+        dash = d.format("%Y-%m-%d"),
     )
 }
 pub fn date_range(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
@@ -142,8 +157,7 @@ impl RunSummary {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("okx_lob=info".parse().unwrap()),
+            EnvFilter::from_default_env().add_directive("okx_lob=info".parse().unwrap()),
         )
         .with_target(false)
         .without_time()
@@ -154,17 +168,25 @@ fn main() -> Result<()> {
     let start = NaiveDate::parse_from_str(&cli.start, "%Y-%m-%d")?;
     let end = match &cli.end {
         Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")?,
-        None    => chrono::Local::now().date_naive(),
+        None => chrono::Local::now().date_naive(),
     };
     let symbols: Vec<String> = match &cli.symbol {
         Some(s) => vec![s.clone()],
-        None    => all_symbols(),
+        None => all_symbols(),
     };
     let workers = cli.workers.unwrap_or_else(|| {
-        thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     });
 
-    tracing::info!("币种: {} 个  日期: {} → {}  处理线程: {}", symbols.len(), start, end, workers);
+    tracing::info!(
+        "币种: {} 个  日期: {} → {}  处理线程: {}",
+        symbols.len(),
+        start,
+        end,
+        workers
+    );
 
     for sym in &symbols {
         std::fs::create_dir_all(raw_dir().join(sym))?;
@@ -183,8 +205,12 @@ fn main() -> Result<()> {
             .build()?;
 
         let download_results = rt.block_on(downloader::download_all(
-            &symbols, start, end, &mp,
-            cli.dl_concurrency, cli.dl_retries,
+            &symbols,
+            start,
+            end,
+            &mp,
+            cli.dl_concurrency,
+            cli.dl_retries,
         ))?;
 
         for (task, result) in download_results {

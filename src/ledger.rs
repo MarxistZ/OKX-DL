@@ -83,17 +83,32 @@ impl DayState {
     pub fn from_legacy_value(raw: &serde_json::Value) -> Self {
         let mut state = DayState::default();
 
-        state.downloaded = raw.get("downloaded").and_then(|v| v.as_bool()).unwrap_or(false);
-        state.not_available = raw.get("not_available").and_then(|v| v.as_bool()).unwrap_or(false);
+        state.downloaded = raw
+            .get("downloaded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        state.not_available = raw
+            .get("not_available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         state.download_attempts = raw
             .get("download_attempts")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .unwrap_or(0);
-        state.processed = raw.get("processed").and_then(|v| v.as_bool()).unwrap_or(false);
-        state.validated = raw.get("validated").and_then(|v| v.as_bool()).unwrap_or(false);
+        state.processed = raw
+            .get("processed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        state.validated = raw
+            .get("validated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         state.rows = raw.get("rows").and_then(|v| v.as_u64()).map(|v| v as usize);
-        state.raw_deleted = raw.get("raw_deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+        state.raw_deleted = raw
+            .get("raw_deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         state.raw_present = state.downloaded && !state.raw_deleted;
         state.parquet_present = state.processed || state.validated;
 
@@ -205,7 +220,11 @@ impl Ledger {
         } else {
             HashMap::new()
         };
-        Self { symbol: symbol.to_string(), map, dirty: false }
+        Self {
+            symbol: symbol.to_string(),
+            map,
+            dirty: false,
+        }
     }
 
     fn key(d: NaiveDate) -> String {
