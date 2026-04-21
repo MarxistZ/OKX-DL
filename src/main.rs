@@ -33,7 +33,6 @@ pub fn all_symbols() -> Vec<String> {
 
 pub fn raw_dir()        -> PathBuf { "data/raw".into() }
 pub fn parquet_dir()    -> PathBuf { "data/parquet".into() }
-pub fn checkpoint_dir() -> PathBuf { "data/checkpoints".into() }
 pub fn ledger_dir()     -> PathBuf { "data/ledger".into() }
 
 pub fn raw_path(symbol: &str, d: NaiveDate) -> PathBuf {
@@ -41,9 +40,6 @@ pub fn raw_path(symbol: &str, d: NaiveDate) -> PathBuf {
 }
 pub fn parquet_path(symbol: &str, d: NaiveDate) -> PathBuf {
     parquet_dir().join(symbol).join(format!("{}.parquet", d.format("%Y-%m-%d")))
-}
-pub fn checkpoint_path(symbol: &str, d: NaiveDate) -> PathBuf {
-    checkpoint_dir().join(symbol).join(format!("{}.json", d.format("%Y-%m-%d")))
 }
 pub fn ledger_path(symbol: &str, d: NaiveDate) -> PathBuf {
     ledger_dir()
@@ -105,6 +101,42 @@ struct Cli {
     dl_retries: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct FailureRecord {
+    pub symbol: String,
+    pub date: NaiveDate,
+    pub stage: &'static str,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub struct RunSummary {
+    pub failures: Vec<FailureRecord>,
+    pub not_available: Vec<FailureRecord>,
+}
+
+impl RunSummary {
+    pub fn has_real_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    pub fn print(&self) {
+        for item in &self.not_available {
+            tracing::info!("404 {} {} {}", item.symbol, item.date, item.reason);
+        }
+
+        for item in &self.failures {
+            tracing::error!(
+                "失败 {} {} {} {}",
+                item.stage,
+                item.symbol,
+                item.date,
+                item.reason
+            );
+        }
+    }
+}
+
 // ── 入口 ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -134,15 +166,14 @@ fn main() -> Result<()> {
 
     tracing::info!("币种: {} 个  日期: {} → {}  处理线程: {}", symbols.len(), start, end, workers);
 
-    // 初始化目录
     for sym in &symbols {
         std::fs::create_dir_all(raw_dir().join(sym))?;
         std::fs::create_dir_all(parquet_dir().join(sym))?;
-        std::fs::create_dir_all(checkpoint_dir().join(sym))?;
+        std::fs::create_dir_all(ledger_dir().join(sym))?;
     }
-    std::fs::create_dir_all(ledger_dir())?;
 
-    // ── 下载阶段 ────────────────────────────────────────────────────────────
+    let mut summary = RunSummary::default();
+
     if !cli.process_only {
         tracing::info!("=== 下载阶段 ===");
         let mp = MultiProgress::new();
@@ -150,25 +181,101 @@ fn main() -> Result<()> {
             .worker_threads(cli.dl_concurrency.max(2))
             .enable_all()
             .build()?;
-        rt.block_on(downloader::download_all(
+
+        let download_results = rt.block_on(downloader::download_all(
             &symbols, start, end, &mp,
             cli.dl_concurrency, cli.dl_retries,
         ))?;
+
+        for (task, result) in download_results {
+            match result {
+                downloader::DownloadResult::NotAvailable => {
+                    summary.not_available.push(FailureRecord {
+                        symbol: task.symbol,
+                        date: task.date,
+                        stage: "download",
+                        reason: "404".to_string(),
+                    });
+                }
+                downloader::DownloadResult::Failed { reason } => {
+                    summary.failures.push(FailureRecord {
+                        symbol: task.symbol,
+                        date: task.date,
+                        stage: "download",
+                        reason,
+                    });
+                }
+                downloader::DownloadResult::Skipped | downloader::DownloadResult::Success => {}
+            }
+        }
     }
 
-    // ── 处理阶段 ────────────────────────────────────────────────────────────
     if !cli.download_only {
         tracing::info!("=== 处理阶段 ===");
         rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build_global()
             .ok();
-        let mp = MultiProgress::new();
-        symbols.par_iter().for_each(|sym| {
-            processor::process_symbol(sym, start, end, &mp);
-        });
+
+        let process_tasks = processor::collect_process_tasks(&symbols, start, end);
+        let process_results: Vec<_> = process_tasks
+            .par_iter()
+            .map(processor::process_day_task)
+            .collect();
+
+        for (task, result) in process_tasks.into_iter().zip(process_results.into_iter()) {
+            if let processor::ProcessResult::Failed { reason } = result {
+                summary.failures.push(FailureRecord {
+                    symbol: task.symbol,
+                    date: task.date,
+                    stage: "process",
+                    reason,
+                });
+            }
+        }
+    }
+
+    summary.print();
+    if summary.has_real_failures() {
+        anyhow::bail!("run completed with failures");
     }
 
     tracing::info!("=== 完成 ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn summary_ignores_not_available_days() {
+        let summary = RunSummary {
+            failures: vec![],
+            not_available: vec![FailureRecord {
+                symbol: "BTC-USDT".to_string(),
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                stage: "download",
+                reason: "404".to_string(),
+            }],
+        };
+
+        assert!(!summary.has_real_failures());
+    }
+
+    #[test]
+    fn summary_reports_real_failures() {
+        let summary = RunSummary {
+            failures: vec![FailureRecord {
+                symbol: "BTC-USDT".to_string(),
+                date: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                stage: "process",
+                reason: "raw file missing".to_string(),
+            }],
+            not_available: vec![],
+        };
+
+        assert!(summary.has_real_failures());
+    }
 }
