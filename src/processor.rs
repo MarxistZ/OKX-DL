@@ -127,6 +127,7 @@ where
     sampler.finish()
 }
 
+#[cfg(test)]
 fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
     let mut sampler = DaySampler::new();
     let mut snaps = Vec::new();
@@ -138,6 +139,7 @@ fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
     Ok(snaps)
 }
 
+#[cfg(test)]
 pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
     let mut snaps = Vec::new();
     process_archive_entries(raw, |snapshot| {
