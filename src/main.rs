@@ -128,6 +128,10 @@ struct Cli {
     /// 下载失败最大重试次数
     #[arg(long, default_value = "5")]
     dl_retries: u32,
+
+    /// 处理成功后原始 tar.gz 保留策略
+    #[arg(long, value_enum, default_value_t = processor::RawRetention::Keep)]
+    raw_retention: processor::RawRetention,
 }
 
 #[derive(Debug, Clone)]
@@ -254,8 +258,13 @@ fn main() -> Result<()> {
         tracing::info!("=== 处理阶段 ===");
         let process_tasks = processor::collect_process_tasks(&symbols, start, end);
         let pool = build_process_pool(workers)?;
-        let process_results: Vec<_> =
-            pool.install(|| process_tasks.par_iter().map(processor::process_day_task).collect());
+        let raw_retention = cli.raw_retention;
+        let process_results: Vec<_> = pool.install(|| {
+            process_tasks
+                .par_iter()
+                .map(|task| processor::process_day_task(task, raw_retention))
+                .collect()
+        });
 
         for (task, result) in process_tasks.into_iter().zip(process_results.into_iter()) {
             if let processor::ProcessResult::Failed { reason } = result {

@@ -6,6 +6,7 @@ use arrow::array::{ArrayRef, Float32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
+use clap::ValueEnum;
 use flate2::read::GzDecoder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -17,77 +18,112 @@ use std::sync::Arc;
 
 // ── 单日 LOB 重建 ────────────────────────────────────────────────────────────
 
-fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
-    let mut lob = Lob::new();
-    let mut snaps = Vec::with_capacity(900_000);
-    let mut next_sample_ms: Option<i64> = None;
-    let mut saw_snapshot = false;
-    let mut bad_lines = 0usize;
-    let mut total_lines = 0usize;
+struct DaySampler {
+    lob: Lob,
+    snaps: Vec<Snapshot>,
+    next_sample_ms: Option<i64>,
+    saw_snapshot: bool,
+    bad_lines: usize,
+    total_lines: usize,
+}
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) if !line.is_empty() => line,
-            _ => continue,
-        };
-        total_lines += 1;
+impl DaySampler {
+    fn new() -> Self {
+        Self {
+            lob: Lob::new(),
+            snaps: Vec::with_capacity(900_000),
+            next_sample_ms: None,
+            saw_snapshot: false,
+            bad_lines: 0,
+            total_lines: 0,
+        }
+    }
 
-        let record: OkxRecord = match serde_json::from_str(&line) {
-            Ok(record) => record,
-            Err(_) => {
-                bad_lines += 1;
+    fn feed_reader<R: BufRead>(&mut self, reader: R) -> Result<()> {
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) if !line.is_empty() => line,
+                _ => continue,
+            };
+            self.total_lines += 1;
+
+            let record: OkxRecord = match serde_json::from_str(&line) {
+                Ok(record) => record,
+                Err(_) => {
+                    self.bad_lines += 1;
+                    continue;
+                }
+            };
+
+            match record.action.as_str() {
+                "snapshot" => {
+                    self.lob.apply(&record);
+                    self.saw_snapshot = self.lob.ready;
+                }
+                "update" if !self.saw_snapshot => anyhow::bail!("first valid record must be snapshot"),
+                "update" => self.lob.apply(&record),
+                _ => continue,
+            }
+
+            if !self.lob.ready {
                 continue;
             }
-        };
 
-        match record.action.as_str() {
-            "snapshot" => {
-                lob.apply(&record);
-                saw_snapshot = lob.ready;
+            let ts = self.lob.ts_ms;
+            let next = self
+                .next_sample_ms
+                .get_or_insert_with(|| (ts / SAMPLE_MS + 1) * SAMPLE_MS);
+            while ts >= *next {
+                self.snaps.push(self.lob.snapshot(*next));
+                *next += SAMPLE_MS;
             }
-            "update" if !saw_snapshot => anyhow::bail!("first valid record must be snapshot"),
-            "update" => lob.apply(&record),
-            _ => continue,
         }
 
-        if !lob.ready {
-            continue;
-        }
-
-        let ts = lob.ts_ms;
-        let next = next_sample_ms.get_or_insert_with(|| (ts / SAMPLE_MS + 1) * SAMPLE_MS);
-        while ts >= *next {
-            snaps.push(lob.snapshot(*next));
-            *next += SAMPLE_MS;
-        }
+        Ok(())
     }
 
-    if !saw_snapshot {
-        anyhow::bail!("no snapshot found in daily file");
-    }
-
-    if bad_lines > 0 && total_lines > 0 {
-        let pct = bad_lines as f64 / total_lines as f64 * 100.0;
-        if pct > 1.0 {
-            tracing::warn!("坏行 {bad_lines}/{total_lines} ({pct:.1}%)");
+    fn finish(self) -> Result<Vec<Snapshot>> {
+        if !self.saw_snapshot {
+            anyhow::bail!("no snapshot found in daily file");
         }
-    }
 
-    Ok(snaps)
+        if self.bad_lines > 0 && self.total_lines > 0 {
+            let pct = self.bad_lines as f64 / self.total_lines as f64 * 100.0;
+            if pct > 1.0 {
+                tracing::warn!("坏行 {}/{} ({pct:.1}%)", self.bad_lines, self.total_lines);
+            }
+        }
+
+        Ok(self.snaps)
+    }
+}
+
+fn process_json_lines<R: BufRead>(reader: R) -> Result<Vec<Snapshot>> {
+    let mut sampler = DaySampler::new();
+    sampler.feed_reader(reader)?;
+    sampler.finish()
 }
 
 pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
     let file = std::fs::File::open(raw)?;
     let gz = GzDecoder::new(file);
     let mut ar = tar::Archive::new(gz);
+    let mut sampler = DaySampler::new();
 
-    let mut entries = ar.entries()?;
-    let entry = entries
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("tar 为空"))??;
+    for entry in ar.entries()? {
+        let entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if entry.header().size()? == 0 {
+            continue;
+        }
 
-    let reader = BufReader::with_capacity(4 * 1024 * 1024, entry);
-    process_json_lines(reader)
+        let reader = BufReader::with_capacity(4 * 1024 * 1024, entry);
+        sampler.feed_reader(reader)?;
+    }
+
+    sampler.finish()
 }
 
 // ── Parquet 写入 + 验证 ───────────────────────────────────────────────────────
@@ -107,6 +143,9 @@ fn make_schema() -> Arc<Schema> {
 
 fn write_parquet(path: &Path, snaps: &[Snapshot], schema: &Arc<Schema>) -> Result<()> {
     let tmp = path.with_extension("tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let ts: Int64Array = snaps.iter().map(|s| s.ts_ms).collect();
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(ts)];
@@ -201,6 +240,12 @@ pub struct ProcessTask {
     pub date: NaiveDate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RawRetention {
+    Keep,
+    Delete,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProcessResult {
     Skipped,
@@ -274,7 +319,7 @@ pub fn collect_process_tasks(
     tasks
 }
 
-pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
+pub fn process_day_task(task: &ProcessTask, raw_retention: RawRetention) -> ProcessResult {
     let raw = raw_path(&task.symbol, task.date);
     let out = parquet_path(&task.symbol, task.date);
     let schema = make_schema();
@@ -323,7 +368,10 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
         };
     }
 
-    let raw_deleted = std::fs::remove_file(&raw).is_ok();
+    let raw_deleted = match raw_retention {
+        RawRetention::Keep => false,
+        RawRetention::Delete => std::fs::remove_file(&raw).is_ok(),
+    };
     persist_process_success(task, snaps.len(), raw_deleted);
 
     ProcessResult::Success
@@ -332,7 +380,45 @@ pub fn process_day_task(task: &ProcessTask) -> ProcessResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::Builder;
+
+    fn unique_symbol(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn write_archive(raw: &Path, entries: &[(&str, &str)]) {
+        if let Some(parent) = raw.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        let file = std::fs::File::create(raw).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = Builder::new(encoder);
+
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, *name, body.as_bytes()).unwrap();
+        }
+
+        tar.finish().unwrap();
+    }
+
+    fn cleanup_symbol(symbol: &str) {
+        let _ = std::fs::remove_dir_all(crate::raw_dir().join(symbol));
+        let _ = std::fs::remove_dir_all(crate::parquet_dir().join(symbol));
+        let _ = std::fs::remove_dir_all(crate::ledger_dir().join(symbol));
+    }
 
     #[test]
     fn process_json_lines_requires_snapshot_before_update() {
@@ -355,12 +441,68 @@ mod tests {
         assert!(!snaps.is_empty());
         assert_eq!(snaps[0].bid_px[0], 100.0);
     }
+
+    #[test]
+    fn process_day_archive_reads_all_regular_entries() {
+        let symbol = unique_symbol("multi-entry");
+        let d = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
+        let raw = crate::raw_path(&symbol, d);
+
+        write_archive(
+            &raw,
+            &[
+                (
+                    "part-1.json",
+                    "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+                ),
+                (
+                    "part-2.json",
+                    "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"3\"]],\"asks\":[]}\n",
+                ),
+            ],
+        );
+
+        let snaps = process_day_archive(&raw).unwrap();
+
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].bid_sz[0], 3.0);
+        cleanup_symbol(&symbol);
+    }
 }
 
 #[cfg(test)]
 mod task_tests {
     use super::*;
-    use crate::ledger::{DayState, DownloadState, ProcessState};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use crate::ledger::{load_day, save_day, DayState, DownloadState, ProcessState};
+    use tar::Builder;
+
+    fn write_archive(raw: &Path, entries: &[(&str, &str)]) {
+        if let Some(parent) = raw.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        let file = std::fs::File::create(raw).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = Builder::new(encoder);
+
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, *name, body.as_bytes()).unwrap();
+        }
+
+        tar.finish().unwrap();
+    }
+
+    fn cleanup_symbol(symbol: &str) {
+        let _ = std::fs::remove_dir_all(crate::raw_dir().join(symbol));
+        let _ = std::fs::remove_dir_all(crate::parquet_dir().join(symbol));
+        let _ = std::fs::remove_dir_all(crate::ledger_dir().join(symbol));
+    }
 
     #[test]
     fn should_process_day_only_when_download_succeeded_and_output_missing() {
@@ -382,5 +524,85 @@ mod task_tests {
         assert!(should_process_day(&ready, true, false));
         assert!(!should_process_day(&done, true, true));
         assert!(!should_process_day(&not_available, false, false));
+    }
+
+    #[test]
+    fn process_day_task_keeps_raw_when_retention_is_keep() {
+        let symbol = format!("keep-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap());
+        let d = NaiveDate::from_ymd_opt(2024, 1, 6).unwrap();
+        let raw = crate::raw_path(&symbol, d);
+        let task = ProcessTask {
+            symbol: symbol.clone(),
+            date: d,
+        };
+
+        write_archive(
+            &raw,
+            &[(
+                "day.json",
+                concat!(
+                    "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+                    "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"3\"]],\"asks\":[]}\n"
+                ),
+            )],
+        );
+        save_day(
+            &symbol,
+            d,
+            &DayState {
+                download: DownloadState::Success,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let result = process_day_task(&task, RawRetention::Keep);
+
+        assert!(matches!(result, ProcessResult::Success));
+        assert!(raw.exists());
+        let state = load_day(&symbol, d);
+        assert!(!state.raw_deleted);
+        assert!(state.raw_present);
+        cleanup_symbol(&symbol);
+    }
+
+    #[test]
+    fn process_day_task_deletes_raw_when_retention_is_delete() {
+        let symbol = format!("delete-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap());
+        let d = NaiveDate::from_ymd_opt(2024, 1, 7).unwrap();
+        let raw = crate::raw_path(&symbol, d);
+        let task = ProcessTask {
+            symbol: symbol.clone(),
+            date: d,
+        };
+
+        write_archive(
+            &raw,
+            &[(
+                "day.json",
+                concat!(
+                    "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+                    "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"3\"]],\"asks\":[]}\n"
+                ),
+            )],
+        );
+        save_day(
+            &symbol,
+            d,
+            &DayState {
+                download: DownloadState::Success,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let result = process_day_task(&task, RawRetention::Delete);
+
+        assert!(matches!(result, ProcessResult::Success));
+        assert!(!raw.exists());
+        let state = load_day(&symbol, d);
+        assert!(state.raw_deleted);
+        assert!(!state.raw_present);
+        cleanup_symbol(&symbol);
     }
 }
