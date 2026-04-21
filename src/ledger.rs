@@ -26,6 +26,16 @@ pub enum ProcessState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Pending,
+    Failed,
+    Success,
+    NotAvailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DayState {
     #[serde(default)]
@@ -42,6 +52,8 @@ pub struct DayState {
     pub raw_present: bool,
     #[serde(default)]
     pub parquet_present: bool,
+    #[serde(default)]
+    pub task_status: TaskStatus,
     #[serde(default)]
     pub raw_deleted: bool,
     #[serde(default)]
@@ -68,6 +80,7 @@ impl Default for DayState {
             rows: None,
             raw_present: false,
             parquet_present: false,
+            task_status: TaskStatus::Pending,
             raw_deleted: false,
             last_error: None,
             updated_at: utc_now_rfc3339(),
@@ -131,10 +144,12 @@ impl DayState {
         state
     }
 
+    #[cfg(test)]
     pub fn can_skip_download(&self, raw_exists: bool) -> bool {
         raw_exists && self.download == DownloadState::Success
     }
 
+    #[cfg(test)]
     pub fn can_skip_process(&self, parquet_exists: bool) -> bool {
         parquet_exists && self.process == ProcessState::Success
     }
@@ -146,6 +161,15 @@ impl DayState {
         self.validated = self.process == ProcessState::Success;
         self.raw_present = self.downloaded && !self.raw_deleted;
         self.parquet_present = self.processed;
+        self.task_status = if self.download == DownloadState::NotAvailable {
+            TaskStatus::NotAvailable
+        } else if self.process == ProcessState::Success {
+            TaskStatus::Success
+        } else if self.download == DownloadState::Failed || self.process == ProcessState::Failed {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Pending
+        };
     }
 
     pub(crate) fn touch_updated_at(&mut self) {
