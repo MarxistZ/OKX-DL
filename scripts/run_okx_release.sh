@@ -6,8 +6,6 @@ BIN="${BIN:-$ROOT_DIR/target/release/okx-lob}"
 
 SYMBOL_ARGS=(
   --symbol
-  BTC-USDT
-  ETH-USDT
   BTC-USDT-SWAP
   ETH-USDT-SWAP
 )

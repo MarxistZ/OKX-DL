@@ -38,7 +38,7 @@ EOF
   ARGS_FILE="$args_file" \
   bash "$SCRIPT_PATH" >/dev/null
 
-  assert_eq "$(cat "$args_file")" $'--symbol\nBTC-USDT\nETH-USDT\nBTC-USDT-SWAP\nETH-USDT-SWAP\n--start\n2024-07-01\n--end\n2024-07-02\n--workers\n4\n--dl-concurrency\n2\n--dl-retries\n5\n--raw-root\n/home/ray/okx-lob/data/raw\n--parquet-root\n/home/ray/okx-lob/data/parquet\n--raw-max-gb\n70\n--raw-check-interval-secs\n5\n--retry-delay-secs\n60' "unexpected fixed CLI arguments"
+  assert_eq "$(cat "$args_file")" $'--symbol\nBTC-USDT-SWAP\nETH-USDT-SWAP\n--start\n2024-07-01\n--end\n2024-07-02\n--workers\n4\n--dl-concurrency\n2\n--dl-retries\n5\n--raw-root\n/home/ray/okx-lob/data/raw\n--parquet-root\n/home/ray/okx-lob/data/parquet\n--raw-max-gb\n70\n--raw-check-interval-secs\n5\n--retry-delay-secs\n60' "unexpected fixed CLI arguments"
 }
 
 test_preserves_binary_exit_code() {
