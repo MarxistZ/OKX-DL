@@ -15,10 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::ledger::{load_day, DayState, DownloadState, ProcessState};
-#[cfg(test)]
-use crate::{date_range, parquet_path, raw_path};
-#[cfg(test)]
 use chrono::NaiveDate;
 
 // ── 单日 LOB 重建 ────────────────────────────────────────────────────────────
@@ -357,8 +353,12 @@ pub fn process_stage(task: &Task, paths: &Paths) -> ProcessStageResult {
         };
     }
 
-    let rows = match process_archive_to_parquet_with_batch_size(&raw, &out, &schema, SNAPSHOT_BATCH_SIZE)
-    {
+    let rows = match process_archive_to_parquet_with_batch_size(
+        &raw,
+        &out,
+        &schema,
+        SNAPSHOT_BATCH_SIZE,
+    ) {
         Ok(rows) => rows,
         Err(err) => {
             return ProcessStageResult::Failed {
@@ -408,7 +408,8 @@ mod tests {
             header.set_size(body.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            tar.append_data(&mut header, *name, body.as_bytes()).unwrap();
+            tar.append_data(&mut header, *name, body.as_bytes())
+                .unwrap();
         }
 
         tar.finish().unwrap();

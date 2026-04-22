@@ -144,16 +144,6 @@ impl DayState {
         state
     }
 
-    #[cfg(test)]
-    pub fn can_skip_download(&self, raw_exists: bool) -> bool {
-        raw_exists && self.download == DownloadState::Success
-    }
-
-    #[cfg(test)]
-    pub fn can_skip_process(&self, parquet_exists: bool) -> bool {
-        parquet_exists && self.process == ProcessState::Success
-    }
-
     pub(crate) fn normalize_derived_flags(&mut self) {
         self.downloaded = self.download == DownloadState::Success;
         self.not_available = self.download == DownloadState::NotAvailable;
@@ -231,6 +221,7 @@ fn lock_day(symbol: &str, d: NaiveDate) -> anyhow::Result<std::fs::File> {
 
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
