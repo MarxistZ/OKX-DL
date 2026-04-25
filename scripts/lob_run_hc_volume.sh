@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 0 ]]; then
-  echo "run_okx_hc_volume.sh does not accept arguments" >&2
+  echo "lob_run_hc_volume.sh does not accept arguments" >&2
   exit 64
 fi
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT_DIR/target/release/okx-lob"
 VOLUME="/mnt/HC_Volume_105514197"
 DATA_ROOT="$HOME/data/okx"

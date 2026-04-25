@@ -3,20 +3,23 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT_DIR/target/release/okx-lob}"
-BUILD="${BUILD:-1}"
+BUILD="${BUILD:-0}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 
-START="${START:-2024-07-01}"
-END="${END:-2024-07-01}"
-SYMBOLS="${SYMBOLS:-BTC-USDT-SWAP}"
-WORKERS="${WORKERS:-1}"
-DL_CONCURRENCY="${DL_CONCURRENCY:-1}"
-DL_RETRIES="${DL_RETRIES:-1}"
+if [[ -z "${START:-}" || -z "${END:-}" ]]; then
+  echo "START and END are required, for example: START=2024-07-01 END=2024-07-31" >&2
+  exit 64
+fi
+
+SYMBOLS="${SYMBOLS:-BTC-USDT-SWAP ETH-USDT-SWAP}"
+WORKERS="${WORKERS:-4}"
+DL_CONCURRENCY="${DL_CONCURRENCY:-2}"
+DL_RETRIES="${DL_RETRIES:-5}"
 RAW_ROOT="${RAW_ROOT:-$ROOT_DIR/data/raw}"
 PARQUET_ROOT="${PARQUET_ROOT:-$ROOT_DIR/data/parquet}"
-RAW_MAX_GB="${RAW_MAX_GB:-20}"
+RAW_MAX_GB="${RAW_MAX_GB:-70}"
 RAW_CHECK_INTERVAL_SECS="${RAW_CHECK_INTERVAL_SECS:-5}"
-RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-30}"
+RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-60}"
 
 if [[ "$BUILD" == "1" ]]; then
   cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
@@ -28,7 +31,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-log_file="$LOG_DIR/smoke-$(date -u +%Y%m%dT%H%M%SZ).log"
+log_file="$LOG_DIR/pipeline-range-$(date -u +%Y%m%dT%H%M%SZ).log"
 
 symbol_args=(--symbol)
 read -r -a symbol_values <<<"$SYMBOLS"
