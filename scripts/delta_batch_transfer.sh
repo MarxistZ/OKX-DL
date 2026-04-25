@@ -70,7 +70,7 @@ case "$MODE" in
     ;;
 esac
 
-file_count="$(find "$INPUT_DIR" -type f -name "$INPUT_PATTERN" | wc -l | tr -d ' ')"
+file_count="$(find -L "$INPUT_DIR" -type f -name "$INPUT_PATTERN" | wc -l | tr -d ' ')"
 
 echo "mode: $MODE"
 echo "bin: $BIN"
@@ -135,11 +135,11 @@ export -f process_one
 
 case "$MODE" in
   encode)
-    find "$INPUT_DIR" -type f -name '*.parquet' -print0 |
+    find -L "$INPUT_DIR" -type f -name '*.parquet' -print0 |
       xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$1"' _
     ;;
   decode)
-    find "$INPUT_DIR" -type f -name '*.okxd.zst' -print0 |
+    find -L "$INPUT_DIR" -type f -name '*.okxd.zst' -print0 |
       xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$1"' _
     ;;
 esac
