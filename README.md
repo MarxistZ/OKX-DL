@@ -28,6 +28,7 @@ cargo build --release
 
 ```bash
 target/release/okx-lob
+target/release/okx-delta
 ```
 
 ## VPS 烟雾测试
@@ -35,7 +36,7 @@ target/release/okx-lob
 先跑一小段数据，确认 VPS 网络、编译、目录权限和处理链路正常：
 
 ```bash
-scripts/vps_smoke_test.sh
+scripts/lob_smoke.sh
 ```
 
 默认会：
@@ -44,14 +45,14 @@ scripts/vps_smoke_test.sh
 - 下载并处理 `BTC-USDT-SWAP`
 - 日期为 `2024-07-01`
 - 使用低并发参数
-- 写日志到 `logs/smoke-*.log`
+- 写日志到 `logs/pipeline-smoke-*.log`
 
 ## 正式运行
 
 正式任务必须显式指定 `START` 和 `END`：
 
 ```bash
-START=2024-07-01 END=2024-07-31 scripts/vps_run_workload.sh
+START=2024-07-01 END=2024-07-31 scripts/lob_run_range.sh
 ```
 
 指定多个币种：
@@ -60,7 +61,7 @@ START=2024-07-01 END=2024-07-31 scripts/vps_run_workload.sh
 START=2024-07-01 \
 END=2024-07-31 \
 SYMBOLS="BTC-USDT-SWAP ETH-USDT-SWAP" \
-scripts/vps_run_workload.sh
+scripts/lob_run_range.sh
 ```
 
 常用参数：
@@ -73,13 +74,13 @@ WORKERS=4 \
 DL_CONCURRENCY=2 \
 DL_RETRIES=5 \
 RAW_MAX_GB=70 \
-scripts/vps_run_workload.sh
+scripts/lob_run_range.sh
 ```
 
 如需让脚本先构建再运行：
 
 ```bash
-BUILD=1 START=2024-07-01 END=2024-07-31 scripts/vps_run_workload.sh
+BUILD=1 START=2024-07-01 END=2024-07-31 scripts/lob_run_range.sh
 ```
 
 ## 输出目录
@@ -101,7 +102,7 @@ END=2024-07-31 \
 RAW_ROOT=/data/okx/raw \
 PARQUET_ROOT=/data/okx/parquet \
 LOG_DIR=/data/okx/logs \
-scripts/vps_run_workload.sh
+scripts/lob_run_range.sh
 ```
 
 注意：账本当前固定写入项目目录下的 `data/ledger`，请从项目根目录运行脚本。
@@ -128,9 +129,25 @@ target/release/okx-lob \
   --raw-max-gb 70
 ```
 
+## Delta 传输压缩
+
+最终落盘格式仍是 Parquet。传输时可以把 Parquet 批量编码成 `.okxd.zst`，下载到本地后再批量解回 Parquet：
+
+```bash
+scripts/delta_batch_transfer.sh encode data/parquet data/transfer
+scripts/delta_batch_transfer.sh decode data/transfer data/parquet-restored
+```
+
+常用参数：
+
+```bash
+BUILD=1 JOBS=8 VERIFY=1 ZSTD_LEVEL=19 \
+scripts/delta_batch_transfer.sh encode data/parquet data/transfer
+```
+
 ## 测试
 
 ```bash
 cargo test
-bash tests/vps_scripts_test.sh
+bash -n scripts/*.sh
 ```
