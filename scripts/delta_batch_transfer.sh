@@ -61,6 +61,29 @@ mkdir -p "$OUTPUT_DIR"
 
 export BIN MODE INPUT_DIR OUTPUT_DIR ZSTD_LEVEL SCALE SKIP_EXISTING VERIFY DRY_RUN
 
+case "$MODE" in
+  encode)
+    INPUT_PATTERN='*.parquet'
+    ;;
+  decode)
+    INPUT_PATTERN='*.okxd.zst'
+    ;;
+esac
+
+file_count="$(find "$INPUT_DIR" -type f -name "$INPUT_PATTERN" | wc -l | tr -d ' ')"
+
+echo "mode: $MODE"
+echo "bin: $BIN"
+echo "input: $INPUT_DIR"
+echo "output: $OUTPUT_DIR"
+echo "files: $file_count"
+echo "jobs: $JOBS"
+
+if [[ "$file_count" == "0" ]]; then
+  echo "no input files matching $INPUT_PATTERN"
+  exit 0
+fi
+
 process_one() {
   local input="$1"
   local rel output
@@ -96,11 +119,14 @@ process_one() {
   fi
 
   if [[ "$MODE" == "encode" ]]; then
+    echo "encode: $input -> $output"
     "$BIN" encode "$input" -o "$output" --zstd-level "$ZSTD_LEVEL" --scale "$SCALE"
     if [[ "$VERIFY" == "1" ]]; then
+      echo "verify: $input <-> $output"
       "$BIN" verify "$input" "$output"
     fi
   else
+    echo "decode: $input -> $output"
     "$BIN" decode "$input" -o "$output"
   fi
 }
@@ -110,10 +136,10 @@ export -f process_one
 case "$MODE" in
   encode)
     find "$INPUT_DIR" -type f -name '*.parquet' -print0 |
-      xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$0"'
+      xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$1"' _
     ;;
   decode)
     find "$INPUT_DIR" -type f -name '*.okxd.zst' -print0 |
-      xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$0"'
+      xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$1"' _
     ;;
 esac
