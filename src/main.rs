@@ -5,7 +5,7 @@ mod pipeline;
 mod processor;
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate};
 use clap::Parser;
 use std::{path::PathBuf, thread, time::Duration};
 use tracing_subscriber::EnvFilter;
@@ -63,6 +63,20 @@ pub fn date_range(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
 fn validate_date_bounds(start: NaiveDate, end: NaiveDate) -> Result<()> {
     if end < start {
         anyhow::bail!("invalid date range: --end {end} is before --start {start}");
+    }
+    Ok(())
+}
+
+fn default_terminal_not_available_cutoff() -> NaiveDate {
+    chrono::Local::now()
+        .date_naive()
+        .checked_sub_days(Days::new(2))
+        .unwrap_or_else(|| chrono::Local::now().date_naive())
+}
+
+fn ensure_no_failed_tasks(report: &pipeline::PipelineReport) -> Result<()> {
+    if report.failed_count > 0 {
+        anyhow::bail!("{} tasks failed", report.failed_count);
     }
     Ok(())
 }
@@ -161,6 +175,7 @@ fn main() -> Result<()> {
         retry_delay: Duration::from_secs(cli.retry_delay_secs),
         dl_retries: cli.dl_retries,
         max_retries: 3,
+        terminal_not_available_cutoff: default_terminal_not_available_cutoff(),
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -176,6 +191,7 @@ fn main() -> Result<()> {
         report.failed_count
     );
 
+    ensure_no_failed_tasks(&report)?;
     tracing::info!("=== 完成 ===");
     Ok(())
 }
@@ -238,5 +254,29 @@ mod tests {
         let msg = err.to_string();
 
         assert!(msg.contains("--symbol"));
+    }
+
+    #[test]
+    fn final_report_with_failed_tasks_is_an_error() {
+        let report = pipeline::PipelineReport {
+            success_count: 1,
+            not_available_count: 2,
+            failed_count: 1,
+        };
+
+        let err = ensure_no_failed_tasks(&report).unwrap_err();
+
+        assert!(err.to_string().contains("1 tasks failed"));
+    }
+
+    #[test]
+    fn final_report_with_only_not_available_tasks_is_successful() {
+        let report = pipeline::PipelineReport {
+            success_count: 1,
+            not_available_count: 2,
+            failed_count: 0,
+        };
+
+        ensure_no_failed_tasks(&report).unwrap();
     }
 }

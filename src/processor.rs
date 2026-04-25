@@ -91,9 +91,15 @@ impl DaySampler {
         }
 
         if self.bad_lines > 0 && self.total_lines > 0 {
-            let pct = self.bad_lines as f64 / self.total_lines as f64 * 100.0;
-            if pct > 1.0 {
-                tracing::warn!("坏行 {}/{} ({pct:.1}%)", self.bad_lines, self.total_lines);
+            let ratio = self.bad_lines as f64 / self.total_lines as f64;
+            if ratio > MAX_BAD_LINE_RATIO {
+                anyhow::bail!(
+                    "bad JSON lines {}/{} ({:.3}%) exceeds {:.3}% threshold",
+                    self.bad_lines,
+                    self.total_lines,
+                    ratio * 100.0,
+                    MAX_BAD_LINE_RATIO * 100.0
+                );
             }
         }
 
@@ -151,6 +157,7 @@ pub fn process_day_archive(raw: &Path) -> Result<Vec<Snapshot>> {
 // ── Parquet 写入 + 验证 ───────────────────────────────────────────────────────
 
 const SNAPSHOT_BATCH_SIZE: usize = 10_000;
+const MAX_BAD_LINE_RATIO: f64 = 0.001;
 
 fn make_schema() -> Arc<Schema> {
     let mut fields = vec![Field::new("timestamp_ms", DataType::Int64, false)];
@@ -528,6 +535,33 @@ mod tests {
         let err = process_archive_to_parquet_with_batch_size(&raw, &out, &schema, 2).unwrap_err();
 
         assert!(err.to_string().contains("1099"));
+        cleanup_symbol(&symbol);
+    }
+
+    #[test]
+    fn processing_fails_when_bad_json_lines_exceed_threshold() {
+        let symbol = unique_symbol("bad-lines");
+        let d = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+        let raw = crate::raw_path(&symbol, d);
+        let out = crate::parquet_path(&symbol, d);
+        let schema = make_schema();
+
+        write_archive(
+            &raw,
+            &[(
+                "day.json",
+                concat!(
+                    "{\"action\":\"snapshot\",\"ts\":\"1000\",\"bids\":[[\"100\",\"1\"]],\"asks\":[[\"101\",\"2\"]]}\n",
+                    "not-json\n",
+                    "{\"action\":\"update\",\"ts\":\"1100\",\"bids\":[[\"100\",\"2\"]],\"asks\":[]}\n"
+                ),
+            )],
+        );
+
+        let err = process_archive_to_parquet_with_batch_size(&raw, &out, &schema, 1).unwrap_err();
+
+        assert!(err.to_string().contains("bad JSON lines"));
+        assert!(!out.exists());
         cleanup_symbol(&symbol);
     }
 }

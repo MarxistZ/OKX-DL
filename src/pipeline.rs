@@ -7,7 +7,7 @@ use chrono::NaiveDate;
 use futures::future::BoxFuture;
 use indicatif::MultiProgress;
 use reqwest::Client;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,6 +75,7 @@ pub struct PipelineConfig {
     pub retry_delay: Duration,
     pub dl_retries: u32,
     pub max_retries: u32,
+    pub terminal_not_available_cutoff: NaiveDate,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -97,15 +98,13 @@ pub struct StartupPlan {
 struct ScheduledTask {
     ready_at: Instant,
     task: Task,
-    retries: u32,
 }
 
 impl ScheduledTask {
-    fn new(task: Task, delay: Duration, retries: u32) -> Self {
+    fn new(task: Task, delay: Duration) -> Self {
         Self {
             ready_at: Instant::now() + delay,
             task,
-            retries,
         }
     }
 }
@@ -220,6 +219,7 @@ pub async fn run_with_stages(
         failed_count: 0,
     };
     let mut delayed = Vec::<ScheduledTask>::new();
+    let mut retry_counts = HashMap::<Task, u32>::new();
     let mut downloads = JoinSet::new();
     let mut processes = JoinSet::new();
 
@@ -275,29 +275,16 @@ pub async fn run_with_stages(
                         cleanup_parquet_artifacts(&config.paths, &task)?;
                         cleanup_raw_artifacts(&config.paths, &task)?;
                         persist_process_failure(&task, &reason)?;
-                        if delayed.iter().any(|s| s.task == task) {
-                            let next_retries = delayed
-                                .iter()
-                                .find(|s| s.task == task)
-                                .map(|s| s.retries)
-                                .unwrap_or(0);
-                            if next_retries < config.max_retries {
-                                delayed.retain(|s| s.task != task);
-                                delayed
-                                    .push(ScheduledTask::new(task, config.retry_delay, next_retries + 1));
-                            } else {
-                                delayed.retain(|s| s.task != task);
-                                startup.remaining = startup.remaining.saturating_sub(1);
-                                report.failed_count += 1;
-                                tracing::error!(
-                                    "任务重试耗尽 {} {}: {reason}",
-                                    task.symbol,
-                                    task.date
-                                );
-                            }
-                        } else {
-                            delayed.push(ScheduledTask::new(task, config.retry_delay, 1));
-                        }
+                        schedule_retry_or_fail(
+                            &mut delayed,
+                            &mut retry_counts,
+                            &mut startup,
+                            &mut report,
+                            task,
+                            config,
+                            &reason,
+                            "任务重试耗尽",
+                        );
                     }
                 }
             }
@@ -310,36 +297,41 @@ pub async fn run_with_stages(
                     }
                     DownloadStageResult::NotAvailable => {
                         cleanup_raw_artifacts(&config.paths, &task)?;
-                        persist_not_available(&task)?;
-                        startup.remaining = startup.remaining.saturating_sub(1);
-                        report.not_available_count += 1;
+                        if task.date <= config.terminal_not_available_cutoff {
+                            persist_not_available(&task)?;
+                            startup.remaining = startup.remaining.saturating_sub(1);
+                            report.not_available_count += 1;
+                        } else {
+                            let reason = format!(
+                                "not available yet: {} is newer than terminal cutoff {}",
+                                task.date, config.terminal_not_available_cutoff
+                            );
+                            persist_download_failure(&task, &reason)?;
+                            schedule_retry_or_fail(
+                                &mut delayed,
+                                &mut retry_counts,
+                                &mut startup,
+                                &mut report,
+                                task,
+                                config,
+                                &reason,
+                                "下载重试耗尽",
+                            );
+                        }
                     }
                     DownloadStageResult::Failed { reason } => {
                         cleanup_raw_artifacts(&config.paths, &task)?;
                         persist_download_failure(&task, &reason)?;
-                        if delayed.iter().any(|s| s.task == task) {
-                            let next_retries = delayed
-                                .iter()
-                                .find(|s| s.task == task)
-                                .map(|s| s.retries)
-                                .unwrap_or(0);
-                            if next_retries < config.max_retries {
-                                delayed.retain(|s| s.task != task);
-                                delayed
-                                    .push(ScheduledTask::new(task, config.retry_delay, next_retries + 1));
-                            } else {
-                                delayed.retain(|s| s.task != task);
-                                startup.remaining = startup.remaining.saturating_sub(1);
-                                report.failed_count += 1;
-                                tracing::error!(
-                                    "下载重试耗尽 {} {}: {reason}",
-                                    task.symbol,
-                                    task.date
-                                );
-                            }
-                        } else {
-                            delayed.push(ScheduledTask::new(task, config.retry_delay, 1));
-                        }
+                        schedule_retry_or_fail(
+                            &mut delayed,
+                            &mut retry_counts,
+                            &mut startup,
+                            &mut report,
+                            task,
+                            config,
+                            &reason,
+                            "下载重试耗尽",
+                        );
                     }
                 }
             }
@@ -347,6 +339,32 @@ pub async fn run_with_stages(
     }
 
     Ok(report)
+}
+
+fn schedule_retry_or_fail(
+    delayed: &mut Vec<ScheduledTask>,
+    retry_counts: &mut HashMap<Task, u32>,
+    startup: &mut StartupPlan,
+    report: &mut PipelineReport,
+    task: Task,
+    config: &PipelineConfig,
+    reason: &str,
+    exhausted_label: &str,
+) {
+    let retries = retry_counts.entry(task.clone()).or_insert(0);
+    if *retries < config.max_retries {
+        *retries += 1;
+        delayed.push(ScheduledTask::new(task, config.retry_delay));
+        return;
+    }
+
+    startup.remaining = startup.remaining.saturating_sub(1);
+    report.failed_count += 1;
+    tracing::error!(
+        "{exhausted_label} {} {}: {reason}",
+        task.symbol,
+        task.date
+    );
 }
 
 fn promote_ready_tasks(delayed: &mut Vec<ScheduledTask>, queue: &mut VecDeque<Task>) {
@@ -547,6 +565,7 @@ mod tests {
             retry_delay: Duration::ZERO,
             dl_retries: 0,
             max_retries: 3,
+            terminal_not_available_cutoff: NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
         }
     }
 
@@ -741,6 +760,61 @@ mod tests {
         assert_eq!(process_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(state.task_status, TaskStatus::NotAvailable);
         assert_eq!(state.download, DownloadState::NotAvailable);
+
+        cleanup_symbol(&task.symbol, &config.paths);
+        let _ = std::fs::remove_dir_all(raw_root);
+        let _ = std::fs::remove_dir_all(parquet_root);
+    }
+
+    #[tokio::test]
+    async fn pipeline_retries_recent_404_instead_of_marking_terminal() {
+        let raw_root = unique_path("recent-404-raw");
+        let parquet_root = unique_path("recent-404-parquet");
+        let mut config = test_config(raw_root.clone(), parquet_root.clone());
+        config.max_retries = 1;
+        config.terminal_not_available_cutoff = NaiveDate::from_ymd_opt(2024, 6, 30).unwrap();
+        let task = Task::new(
+            unique_symbol("recent-404"),
+            NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+        );
+
+        let download_attempts = Arc::new(AtomicUsize::new(0));
+        let process_attempts = Arc::new(AtomicUsize::new(0));
+
+        let download_counter = Arc::clone(&download_attempts);
+        let download: DownloadFn = Arc::new(move |_task: Task| -> BoxFuture<'static, DownloadStageResult> {
+            let counter = Arc::clone(&download_counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                DownloadStageResult::NotAvailable
+            })
+        });
+
+        let process_counter = Arc::clone(&process_attempts);
+        let process: ProcessFn = Arc::new(move |_task: Task| {
+            process_counter.fetch_add(1, Ordering::SeqCst);
+            ProcessStageResult::Failed {
+                reason: "process should not run".to_string(),
+            }
+        });
+
+        let report = run_with_stages(vec![task.clone()], &config, download, process)
+            .await
+            .unwrap();
+
+        let state = load_day(&task.symbol, task.date);
+        assert_eq!(report.success_count, 0);
+        assert_eq!(report.not_available_count, 0);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(download_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(process_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(state.task_status, TaskStatus::Failed);
+        assert_eq!(state.download, DownloadState::Failed);
+        assert!(state
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not available yet"));
 
         cleanup_symbol(&task.symbol, &config.paths);
         let _ = std::fs::remove_dir_all(raw_root);
