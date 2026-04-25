@@ -5,7 +5,11 @@ edition = "2021"
 
 [[bin]]
 name = "okx-lob"
-path = "src/main.rs"
+path = "src/bin/okx-lob.rs"
+
+[[bin]]
+name = "okx-delta"
+path = "src/bin/okx-delta.rs"
 
 [dependencies]
 # async 运行时
@@ -17,6 +21,7 @@ bytes   = "1"
 # 序列化
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+zstd = "0.13"
 # 日期
 chrono = { version = "0.4", features = ["clock", "serde"] }
 # 错误处理
