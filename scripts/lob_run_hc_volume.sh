@@ -12,22 +12,26 @@ VOLUME="/mnt/HC_Volume_105514197"
 DATA_ROOT="$HOME/data/okx"
 PARQUET_TARGET="$VOLUME/okx/parquet"
 PARQUET_LINK="$DATA_ROOT/parquet"
+LOG_DIR="$DATA_ROOT/logs"
+LOG_FILE="$LOG_DIR/lob-hc-volume-$(date -u +%Y%m%dT%H%M%SZ).log"
 
 if [[ ! -d "$VOLUME" ]]; then
   echo "missing volume: $VOLUME" >&2
   exit 65
 fi
 
-mkdir -p "$DATA_ROOT" "$DATA_ROOT/raw" "$DATA_ROOT/logs" "$PARQUET_TARGET"
+mkdir -p "$DATA_ROOT" "$DATA_ROOT/raw" "$LOG_DIR" "$PARQUET_TARGET"
 ln -s "$PARQUET_TARGET" "$PARQUET_LINK"
 
 cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
 
 echo "parquet: $PARQUET_LINK -> $PARQUET_TARGET"
 echo "raw: $DATA_ROOT/raw"
+echo "log: $LOG_FILE"
 echo "params: workers=10 dl_concurrency=4 raw_max_gb=320"
 
-exec "$BIN" \
+set +e
+"$BIN" \
   --symbol \
   BTC-USDT BTC-USDT-SWAP \
   XRP-USDT XRP-USDT-SWAP \
@@ -46,4 +50,9 @@ exec "$BIN" \
   --parquet-root "$PARQUET_LINK" \
   --raw-max-gb 320 \
   --raw-check-interval-secs 5 \
-  --retry-delay-secs 60
+  --retry-delay-secs 60 \
+  2>&1 | tee "$LOG_FILE"
+status=${PIPESTATUS[0]}
+set -e
+
+exit "$status"
