@@ -2,7 +2,7 @@
 set -euo pipefail
 
 while true; do
-  rclone copy /mnt/HC_Volume_105514197/okx/parquet gdrive:okx/parquet \
+  rclone copy "$HOME/data/okx/transfer" gdrive:okx/transfer \
     --progress \
     --transfers 8 \
     --checkers 16 \
@@ -11,6 +11,6 @@ while true; do
     --retries 10 \
     --low-level-retries 20 \
     --stats 30s
-    
+
   sleep 60
 done
