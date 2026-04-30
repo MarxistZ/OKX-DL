@@ -7,7 +7,7 @@ use chrono::NaiveDate;
 use futures::future::BoxFuture;
 use indicatif::MultiProgress;
 use reqwest::Client;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -109,8 +109,7 @@ impl ScheduledTask {
     }
 }
 
-pub type DownloadFn =
-    Arc<dyn Fn(Task) -> BoxFuture<'static, DownloadStageResult> + Send + Sync>;
+pub type DownloadFn = Arc<dyn Fn(Task) -> BoxFuture<'static, DownloadStageResult> + Send + Sync>;
 pub type ProcessFn = Arc<dyn Fn(Task) -> ProcessStageResult + Send + Sync>;
 
 pub fn prepare_startup(tasks: &[Task], paths: &Paths) -> Result<StartupPlan> {
@@ -172,7 +171,13 @@ pub async fn run(
         })
         .collect();
 
-    for symbol in symbols {
+    run_tasks(tasks, config).await
+}
+
+pub async fn run_tasks(tasks: Vec<Task>, config: PipelineConfig) -> Result<PipelineReport> {
+    let symbols: HashSet<String> = tasks.iter().map(|task| task.symbol.clone()).collect();
+
+    for symbol in &symbols {
         std::fs::create_dir_all(config.paths.raw_dir(symbol))?;
         std::fs::create_dir_all(config.paths.parquet_dir(symbol))?;
         std::fs::create_dir_all(ledger_dir().join(symbol))?;
@@ -194,7 +199,9 @@ pub async fn run(
         let client = Arc::clone(&download_client);
         let paths = download_paths.clone();
         let mp = Arc::clone(&download_mp);
-        Box::pin(async move { downloader::download_stage(client, &task, &paths, mp.as_ref(), retries).await })
+        Box::pin(async move {
+            downloader::download_stage(client, &task, &paths, mp.as_ref(), retries).await
+        })
     });
 
     let process_paths = config.paths.clone();
@@ -341,6 +348,47 @@ pub async fn run_with_stages(
     Ok(report)
 }
 
+pub fn write_summary_csv(tasks: &[Task], path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut out = String::from("inst,tradedate,status,rows,error\n");
+    for task in tasks {
+        let state = load_day(&task.symbol, task.date);
+        let status = match state.task_status {
+            TaskStatus::Pending => "pending",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Success => "success",
+            TaskStatus::NotAvailable => "not_available",
+        };
+        let rows = state.rows.map(|rows| rows.to_string()).unwrap_or_default();
+        let error = state.last_error.unwrap_or_default();
+
+        out.push_str(&csv_field(&task.symbol));
+        out.push(',');
+        out.push_str(&task.date.format("%Y-%m-%d").to_string());
+        out.push(',');
+        out.push_str(status);
+        out.push(',');
+        out.push_str(&rows);
+        out.push(',');
+        out.push_str(&csv_field(&error));
+        out.push('\n');
+    }
+
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn schedule_retry_or_fail(
     delayed: &mut Vec<ScheduledTask>,
     retry_counts: &mut HashMap<Task, u32>,
@@ -360,11 +408,7 @@ fn schedule_retry_or_fail(
 
     startup.remaining = startup.remaining.saturating_sub(1);
     report.failed_count += 1;
-    tracing::error!(
-        "{exhausted_label} {} {}: {reason}",
-        task.symbol,
-        task.date
-    );
+    tracing::error!("{exhausted_label} {} {}: {reason}", task.symbol, task.date);
 }
 
 fn promote_ready_tasks(delayed: &mut Vec<ScheduledTask>, queue: &mut VecDeque<Task>) {
@@ -451,13 +495,21 @@ fn persist_process_failure(task: &Task, reason: &str) -> Result<()> {
 
 fn cleanup_raw_artifacts(paths: &Paths, task: &Task) -> Result<()> {
     remove_if_exists(&paths.raw_path(&task.symbol, task.date))?;
-    remove_if_exists(&paths.raw_path(&task.symbol, task.date).with_extension("tmp"))?;
+    remove_if_exists(
+        &paths
+            .raw_path(&task.symbol, task.date)
+            .with_extension("tmp"),
+    )?;
     Ok(())
 }
 
 fn cleanup_parquet_artifacts(paths: &Paths, task: &Task) -> Result<()> {
     remove_if_exists(&paths.parquet_path(&task.symbol, task.date))?;
-    remove_if_exists(&paths.parquet_path(&task.symbol, task.date).with_extension("tmp"))?;
+    remove_if_exists(
+        &paths
+            .parquet_path(&task.symbol, task.date)
+            .with_extension("tmp"),
+    )?;
     Ok(())
 }
 
@@ -671,22 +723,27 @@ mod tests {
         let raw_root = unique_path("retry-raw");
         let parquet_root = unique_path("retry-parquet");
         let config = test_config(raw_root.clone(), parquet_root.clone());
-        let task = Task::new(unique_symbol("retry"), NaiveDate::from_ymd_opt(2024, 7, 1).unwrap());
+        let task = Task::new(
+            unique_symbol("retry"),
+            NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+        );
 
         let download_attempts = Arc::new(AtomicUsize::new(0));
         let process_attempts = Arc::new(AtomicUsize::new(0));
 
         let download_paths = config.paths.clone();
         let download_counter = Arc::clone(&download_attempts);
-        let download: DownloadFn = Arc::new(move |task: Task| -> BoxFuture<'static, DownloadStageResult> {
-            let paths = download_paths.clone();
-            let counter = Arc::clone(&download_counter);
-            Box::pin(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                touch(&paths.raw_path(&task.symbol, task.date), b"raw");
-                DownloadStageResult::Success
-            })
-        });
+        let download: DownloadFn = Arc::new(
+            move |task: Task| -> BoxFuture<'static, DownloadStageResult> {
+                let paths = download_paths.clone();
+                let counter = Arc::clone(&download_counter);
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    touch(&paths.raw_path(&task.symbol, task.date), b"raw");
+                    DownloadStageResult::Success
+                })
+            },
+        );
 
         let process_paths = config.paths.clone();
         let process_counter = Arc::clone(&process_attempts);
@@ -698,7 +755,10 @@ mod tests {
                 };
             }
 
-            touch(&process_paths.parquet_path(&task.symbol, task.date), b"parquet");
+            touch(
+                &process_paths.parquet_path(&task.symbol, task.date),
+                b"parquet",
+            );
             ProcessStageResult::Success { rows: 1 }
         });
 
@@ -727,19 +787,24 @@ mod tests {
         let raw_root = unique_path("404-raw");
         let parquet_root = unique_path("404-parquet");
         let config = test_config(raw_root.clone(), parquet_root.clone());
-        let task = Task::new(unique_symbol("404"), NaiveDate::from_ymd_opt(2024, 7, 1).unwrap());
+        let task = Task::new(
+            unique_symbol("404"),
+            NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+        );
 
         let download_attempts = Arc::new(AtomicUsize::new(0));
         let process_attempts = Arc::new(AtomicUsize::new(0));
 
         let download_counter = Arc::clone(&download_attempts);
-        let download: DownloadFn = Arc::new(move |_task: Task| -> BoxFuture<'static, DownloadStageResult> {
-            let counter = Arc::clone(&download_counter);
-            Box::pin(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                DownloadStageResult::NotAvailable
-            })
-        });
+        let download: DownloadFn = Arc::new(
+            move |_task: Task| -> BoxFuture<'static, DownloadStageResult> {
+                let counter = Arc::clone(&download_counter);
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    DownloadStageResult::NotAvailable
+                })
+            },
+        );
 
         let process_counter = Arc::clone(&process_attempts);
         let process: ProcessFn = Arc::new(move |_task: Task| {
@@ -782,13 +847,15 @@ mod tests {
         let process_attempts = Arc::new(AtomicUsize::new(0));
 
         let download_counter = Arc::clone(&download_attempts);
-        let download: DownloadFn = Arc::new(move |_task: Task| -> BoxFuture<'static, DownloadStageResult> {
-            let counter = Arc::clone(&download_counter);
-            Box::pin(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                DownloadStageResult::NotAvailable
-            })
-        });
+        let download: DownloadFn = Arc::new(
+            move |_task: Task| -> BoxFuture<'static, DownloadStageResult> {
+                let counter = Arc::clone(&download_counter);
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    DownloadStageResult::NotAvailable
+                })
+            },
+        );
 
         let process_counter = Arc::clone(&process_attempts);
         let process: ProcessFn = Arc::new(move |_task: Task| {
@@ -819,5 +886,99 @@ mod tests {
         cleanup_symbol(&task.symbol, &config.paths);
         let _ = std::fs::remove_dir_all(raw_root);
         let _ = std::fs::remove_dir_all(parquet_root);
+    }
+
+    #[tokio::test]
+    async fn run_tasks_processes_exact_task_list_without_range_expansion() {
+        let raw_root = unique_path("exact-tasks-raw");
+        let parquet_root = unique_path("exact-tasks-parquet");
+        let config = test_config(raw_root.clone(), parquet_root.clone());
+        let symbol = unique_symbol("exact-tasks");
+        let first = Task::new(symbol.clone(), NaiveDate::from_ymd_opt(2024, 7, 1).unwrap());
+        let second = Task::new(symbol.clone(), NaiveDate::from_ymd_opt(2024, 7, 5).unwrap());
+        let tasks = vec![first.clone(), second.clone()];
+
+        let download_paths = config.paths.clone();
+        let download: DownloadFn = Arc::new(
+            move |task: Task| -> BoxFuture<'static, DownloadStageResult> {
+                let paths = download_paths.clone();
+                Box::pin(async move {
+                    touch(&paths.raw_path(&task.symbol, task.date), b"raw");
+                    DownloadStageResult::Success
+                })
+            },
+        );
+
+        let process_paths = config.paths.clone();
+        let process: ProcessFn = Arc::new(move |task: Task| {
+            touch(
+                &process_paths.parquet_path(&task.symbol, task.date),
+                b"parquet",
+            );
+            ProcessStageResult::Success { rows: 1 }
+        });
+
+        let report = run_with_stages(tasks, &config, download, process)
+            .await
+            .unwrap();
+
+        assert_eq!(report.success_count, 2);
+        assert!(config
+            .paths
+            .parquet_path(&first.symbol, first.date)
+            .exists());
+        assert!(config
+            .paths
+            .parquet_path(&second.symbol, second.date)
+            .exists());
+        assert!(!config
+            .paths
+            .parquet_path(&symbol, NaiveDate::from_ymd_opt(2024, 7, 2).unwrap())
+            .exists());
+
+        cleanup_symbol(&symbol, &config.paths);
+        let _ = std::fs::remove_dir_all(raw_root);
+        let _ = std::fs::remove_dir_all(parquet_root);
+    }
+
+    #[test]
+    fn write_summary_csv_exports_day_level_ledger_status() {
+        let path = unique_path("summary").join("summary.csv");
+        let success = Task::new(
+            unique_symbol("summary-success"),
+            NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+        );
+        let failed = Task::new(
+            unique_symbol("summary-failed"),
+            NaiveDate::from_ymd_opt(2024, 7, 2).unwrap(),
+        );
+
+        mutate_day(&success.symbol, success.date, |state| {
+            state.download = DownloadState::Success;
+            state.process = ProcessState::Success;
+            state.rows = Some(123);
+            Ok(())
+        })
+        .unwrap();
+        mutate_day(&failed.symbol, failed.date, |state| {
+            state.download = DownloadState::Failed;
+            state.last_error = Some("network, retry exhausted".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        write_summary_csv(&[success.clone(), failed.clone()], &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("inst,tradedate,status,rows,error\n"));
+        assert!(text.contains(&format!("{},2024-07-01,success,123,", success.symbol)));
+        assert!(text.contains(&format!(
+            "{},2024-07-02,failed,,\"network, retry exhausted\"",
+            failed.symbol
+        )));
+
+        cleanup_symbol(&success.symbol, &Paths::default());
+        cleanup_symbol(&failed.symbol, &Paths::default());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
