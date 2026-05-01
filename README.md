@@ -213,11 +213,7 @@ CLEAN_PARQUET_AFTER_UPLOAD=1
 如果要交给 systemd 管理，可以安装 systemd timer：
 
 ```bash
-mkdir -p "$HOME/.config/systemd/user"
-cp deploy/systemd/okx-lob-daily.service "$HOME/.config/systemd/user/"
-cp deploy/systemd/okx-lob-daily.timer "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
-systemctl --user enable --now okx-lob-daily.timer
+deploy/install-okx-lob-daily-timer.sh
 ```
 
 ## Delta 传输压缩
