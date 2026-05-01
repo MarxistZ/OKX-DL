@@ -1,0 +1,10 @@
+[Unit]
+Description=OKX LOB daily update and upload
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Quant/OKX-DL
+Environment=OKX_DAILY_ENV_FILE=%h/.config/okx-lob-daily.env
+ExecStart=%h/Quant/OKX-DL/scripts/okx_lob_daily_server.sh

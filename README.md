@@ -129,6 +129,97 @@ target/release/okx-lob \
   --raw-max-gb 70
 ```
 
+## 精确补录
+
+如需只补指定 `inst + tradedate`，写一个 target 文件，一行一个目标：
+
+```text
+BTC-USDT-SWAP:2024-07-01
+BTC-USDT-SWAP:2024-07-05
+ETH-USDT-SWAP:2024-07-03
+```
+
+然后运行：
+
+```bash
+target/release/okx-lob \
+  --target-file targets/backfill.txt \
+  --summary-csv logs/backfill-summary.csv \
+  --workers 4 \
+  --dl-concurrency 2 \
+  --dl-retries 5
+```
+
+`--target-file` 模式只处理文件里的精确目标，不会把多个 inst 和日期扩展成连续区间。
+
+## 每日定时拉取并上传
+
+`scripts/lob_run_daily.sh` 执行一次完整日常任务：生成最近 N 天 target 文件、运行补录、生成 summary、上传 Parquet 到 Google Drive、编码 transfer 格式、上传 transfer 到 Google Drive、清理临时文件。它适合由 cron 或 systemd timer 定时调用：
+
+```bash
+BUILD=1 \
+LOOKBACK_DAYS=3 \
+SYMBOLS="BTC-USDT-SWAP ETH-USDT-SWAP" \
+DATA_ROOT="$HOME/data/okx" \
+GDRIVE_PARQUET_DEST="gdrive:okx/parquet" \
+GDRIVE_TRANSFER_DEST="gdrive:okx/transfer" \
+scripts/lob_run_daily.sh
+```
+
+默认只清理 raw/tmp 文件。确认 Google Drive 是主存储后，可以设置 `CLEAN_PARQUET_AFTER_UPLOAD=1`，两种格式都上传成功后删除本次 target 对应的本地 Parquet 和 transfer 文件。
+
+### 腾讯云轻量日更
+
+2 vCPU / 2GB RAM / 40GB SSD 的轻量服务器应使用保守参数串行跑。Rust 已经编译完成时，不需要重新构建，只需要配置环境文件并让每日任务调用 server wrapper：
+
+```bash
+mkdir -p "$HOME/.config"
+cp deploy/okx-lob-daily.env.example "$HOME/.config/okx-lob-daily.env"
+```
+
+编辑 `~/.config/okx-lob-daily.env`，至少确认：
+
+```bash
+SYMBOLS="BTC-USDT-SWAP ETH-USDT-SWAP"
+BIN="$HOME/Quant/OKX-DL/target/release/okx-lob"
+GDRIVE_PARQUET_DEST="gdrive:okx/parquet"
+GDRIVE_TRANSFER_DEST="gdrive:okx/transfer"
+GDRIVE_LOG_DEST="gdrive:okx/logs"
+```
+
+每日任务执行：
+
+```bash
+cd "$HOME/Quant/OKX-DL"
+scripts/okx_lob_daily_server.sh
+```
+
+`scripts/okx_lob_daily_server.sh` 会加载 `~/.config/okx-lob-daily.env`，默认使用小服务器安全参数：
+
+```bash
+LOOKBACK_DAYS=1
+WORKERS=1
+DL_CONCURRENCY=1
+TRANSFER_JOBS=1
+RCLONE_TRANSFERS=1
+RCLONE_CHECKERS=2
+ZSTD_LEVEL=3
+RAW_MAX_GB=8
+CLEAN_PARQUET_AFTER_UPLOAD=1
+```
+
+建议调度在 UTC 04:00 之后运行。新加坡/北京时间对应 12:00 之后，东京对应 13:00 之后。
+
+如果要交给 systemd 管理，可以安装 systemd timer：
+
+```bash
+mkdir -p "$HOME/.config/systemd/user"
+cp deploy/systemd/okx-lob-daily.service "$HOME/.config/systemd/user/"
+cp deploy/systemd/okx-lob-daily.timer "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now okx-lob-daily.timer
+```
+
 ## Delta 传输压缩
 
 最终落盘格式仍是 Parquet。传输时可以把 Parquet 批量编码成 `.okxd.zst`，下载到本地后再批量解回 Parquet：

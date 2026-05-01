@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OKX LOB daily update after UTC day data is available
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+Unit=okx-lob-daily.service
+
+[Install]
+WantedBy=timers.target
