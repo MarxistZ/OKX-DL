@@ -180,7 +180,7 @@ cp deploy/okx-lob-daily.env.example "$HOME/.config/okx-lob-daily.env"
 编辑 `~/.config/okx-lob-daily.env`，至少确认：
 
 ```bash
-SYMBOLS="BTC-USDT-SWAP ETH-USDT-SWAP"
+SYMBOLS="AVAX-USDT AVAX-USDT-SWAP BNB-USDT BNB-USDT-SWAP BTC-USDT BTC-USDT-SWAP DOGE-USDT DOGE-USDT-SWAP ETH-USDT ETH-USDT-SWAP LINK-USDT LINK-USDT-SWAP SOL-USDT SOL-USDT-SWAP XRP-USDT XRP-USDT-SWAP"
 BIN="$HOME/Quant/OKX-DL/target/release/okx-lob"
 GDRIVE_PARQUET_DEST="gdrive:okx/parquet"
 GDRIVE_TRANSFER_DEST="gdrive:okx/transfer"
