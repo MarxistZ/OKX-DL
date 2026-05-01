@@ -23,6 +23,7 @@ TARGET_DIR="${TARGET_DIR:-$DATA_ROOT/targets}"
 LOG_DIR="${LOG_DIR:-$DATA_ROOT/logs}"
 GDRIVE_PARQUET_DEST="${GDRIVE_PARQUET_DEST:-gdrive:okx/parquet}"
 GDRIVE_TRANSFER_DEST="${GDRIVE_TRANSFER_DEST:-gdrive:okx/transfer}"
+GDRIVE_LOG_DEST="${GDRIVE_LOG_DEST:-gdrive:okx/logs}"
 CLEAN_PARQUET_AFTER_UPLOAD="${CLEAN_PARQUET_AFTER_UPLOAD:-0}"
 
 RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-8}"
@@ -89,6 +90,7 @@ cmd=(
   echo "transfer_root: $TRANSFER_ROOT"
   echo "gdrive_parquet_dest: $GDRIVE_PARQUET_DEST"
   echo "gdrive_transfer_dest: $GDRIVE_TRANSFER_DEST"
+  echo "gdrive_log_dest: $GDRIVE_LOG_DEST"
 } | tee "$log_file"
 
 set +e
@@ -132,6 +134,24 @@ rclone copy "$TRANSFER_ROOT" "$GDRIVE_TRANSFER_DEST" \
   --stats 30s \
   2>&1 | tee -a "$log_file"
 
+log_upload_status=0
+if [[ -n "$GDRIVE_LOG_DEST" ]]; then
+  set +e
+  rclone copy "$LOG_DIR" "$GDRIVE_LOG_DEST" \
+    --progress \
+    --transfers 1 \
+    --checkers 2 \
+    --retries 5 \
+    --low-level-retries 10 \
+    --stats 30s \
+    2>&1 | tee -a "$log_file"
+  log_upload_status=${PIPESTATUS[0]}
+  set -e
+  if [[ "$log_upload_status" -ne 0 ]]; then
+    echo "log upload failed with status $log_upload_status; continuing cleanup" | tee -a "$log_file"
+  fi
+fi
+
 find "$RAW_ROOT" "$PARQUET_ROOT" -type f -name '*.tmp' -delete
 find "$RAW_ROOT" -type d -empty -delete
 
@@ -144,3 +164,5 @@ if [[ "$CLEAN_PARQUET_AFTER_UPLOAD" == "1" ]]; then
   find "$PARQUET_ROOT" -type d -empty -delete
   find "$TRANSFER_ROOT" -type d -empty -delete
 fi
+
+exit "$log_upload_status"
